@@ -39,3 +39,11 @@ ms_sync/
 outputs/
 output/
 logs/
+
+# Machine-specific launchers and installation configuration (kept locally).
+/r2.sh
+/training/install_requirements.sh
+/scripts/local/profile_native_single_gpu.sh
+
+# Local experiment notes; source and reusable analysis tools may be tracked.
+/scripts/local/*_experiments.md

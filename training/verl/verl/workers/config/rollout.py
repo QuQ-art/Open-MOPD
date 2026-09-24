@@ -188,6 +188,16 @@ class RolloutConfig(BaseConfig):
     # optimizer updates are visible without actor -> rollout weight copies.
     share_weights: bool = False
 
+    # Stage one teacher FSDP1 CPU shard during student log-prob computation.
+    teacher_param_prefetch: bool = False
+
+    # Hard bound on the extra resident teacher shard while student computes.
+    teacher_param_prefetch_max_mb: int = 768
+
+    # Stage two: overlap one primary teacher model forward with student scoring.
+    # Initially restricted to single-GPU, single-micro-batch MT-OPD.
+    teacher_forward_overlap: bool = False
+
     # Diagnostic-only switch for a preloaded vLLM engine.  It leaves the
     # checkpoint-loaded weights untouched for the first rollout transition,
     # allowing validation to distinguish checkpoint loading from the online

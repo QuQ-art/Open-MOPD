@@ -20,6 +20,7 @@ Single Process Actor
 import logging
 import math
 import os
+from typing import Callable
 
 import torch
 from torch import nn
@@ -238,8 +239,47 @@ class DataParallelPPOActor(BasePPOActor):
         if self._opd_refresh_advantage and torch.distributed.get_rank() == 0:
             print(f"{role} opd_refresh_advantage=True mode={self._opd_reward_weight_mode}")
 
+    def _log_prob_model_forward(self, prefetch_callback, prefetch_point, **model_inputs):
+        if prefetch_callback is None:
+            return self.actor_module(**model_inputs)
+        if prefetch_point == "before_model_forward":
+            prefetch_callback()
+            return self.actor_module(**model_inputs)
+
+        if prefetch_point == "first_decoder_layer_post":
+            trigger_module = next(
+                (module for module in self.actor_module.modules() if type(module).__name__.endswith("DecoderLayer")),
+                None,
+            )
+        else:
+            trigger_module = next((module for module in self.actor_module.modules() if isinstance(module, nn.Linear)), None)
+        if trigger_module is None:
+            raise RuntimeError(f"student model has no module for teacher prefetch point {prefetch_point}")
+        triggered = False
+
+        def trigger(*_args):
+            nonlocal triggered
+            if not triggered:
+                triggered = True
+                prefetch_callback()
+
+        if prefetch_point == "first_linear_pre":
+            hook = trigger_module.register_forward_pre_hook(trigger)
+        elif prefetch_point in ("first_linear_post", "first_decoder_layer_post"):
+            hook = trigger_module.register_forward_hook(trigger)
+        else:
+            raise ValueError(f"unsupported teacher prefetch point: {prefetch_point}")
+        try:
+            output = self.actor_module(**model_inputs)
+        finally:
+            hook.remove()
+        if not triggered:
+            raise RuntimeError(f"student prefetch point {prefetch_point} did not run during log-prob forward")
+        return output
+
     def _forward_micro_batch(
-        self, micro_batch, temperature, calculate_entropy=False, top_k=0, student_top_k_ids=None
+        self, micro_batch, temperature, calculate_entropy=False, top_k=0, student_top_k_ids=None,
+        prefetch_callback=None, prefetch_point="before_microbatch",
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Returns:
@@ -327,7 +367,9 @@ class DataParallelPPOActor(BasePPOActor):
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
 
-                output = self.actor_module(
+                output = self._log_prob_model_forward(
+                    prefetch_callback,
+                    prefetch_point,
                     input_ids=input_ids_rmpad,
                     attention_mask=None,
                     position_ids=position_ids_rmpad,
@@ -493,7 +535,9 @@ class DataParallelPPOActor(BasePPOActor):
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
 
-                output = self.actor_module(
+                output = self._log_prob_model_forward(
+                    prefetch_callback,
+                    prefetch_point,
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
@@ -858,12 +902,14 @@ class DataParallelPPOActor(BasePPOActor):
         return grad_norm
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
-    def compute_log_prob(self, data: DataProto, calculate_entropy=False) -> torch.Tensor:
+    def compute_log_prob(
+        self, data: DataProto, calculate_entropy=False, prefetch_callback: Callable[[], None] | None = None,
+        prefetch_point: str = "before_microbatch",
+    ) -> torch.Tensor:
         """Compute the log probability of the responses given input_ids, attention_mask and position_ids
 
         Args:
             data (DataProto): a DataProto containing keys
-
                 ``input_ids``: tensor of shape [batch_size, sequence_length]. torch.int64. Note that input_ids is the
                 concatenation of prompt and response. Note that ``sequence_length = prompt_length + response_length``.
 
@@ -872,6 +918,8 @@ class DataParallelPPOActor(BasePPOActor):
                 ``position_ids``: tensor of shape [batch_size, sequence_length]. torch.int64.
 
                 ``responses``:  tensor of shape [batch_size, response_length]. torch.int64.
+
+            prefetch_callback: Called once at ``prefetch_point`` in the first micro-batch.
 
         Returns:
             torch.Tensor: the log_prob tensor
@@ -904,9 +952,15 @@ class DataParallelPPOActor(BasePPOActor):
         for micro_batch in micro_batches:
             micro_batch = micro_batch.to(get_device_id())
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+            callback = prefetch_callback
+            prefetch_callback = None
+            if callback is not None and prefetch_point == "before_microbatch":
+                callback()
+                callback = None
             with torch.no_grad():
                 entropy, log_probs, topk_ids, topk_log_probs = self._forward_micro_batch(
-                    model_inputs, temperature=temperature, calculate_entropy=calculate_entropy, top_k=top_k
+                    model_inputs, temperature=temperature, calculate_entropy=calculate_entropy, top_k=top_k,
+                    prefetch_callback=callback, prefetch_point=prefetch_point,
                 )
             # Keep on GPU to avoid expensive CPU-GPU transfer for large top-k
             # log_probs = log_probs.to("cpu")

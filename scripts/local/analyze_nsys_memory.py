@@ -222,6 +222,49 @@ def main() -> None:
             f"{ms(duration_ns(step_dma)):.3f} | {ms(intersection_ns(step_dma, step_kernels)):.3f} |"
         )
 
+    if any(name == "openmopd::io::h2d::teacher_prefetch" for _, _, name in nvtx):
+        print("\n## Teacher parameter prefetch\n")
+        print("GPU copy intervals are linked to the prefetch API range by CUDA correlation ID.\n")
+        print("| Step | H2D MiB | GPU copy (ms) | Within student phase (ms) | With student kernels (ms) |")
+        print("|---|---:|---:|---:|---:|")
+        for step_start, step_end, step_name in steps:
+            prefetch_ranges = [
+                (start, end)
+                for start, end, name in nvtx
+                if name == "openmopd::io::h2d::teacher_prefetch"
+                and step_start <= start <= end <= step_end
+            ]
+            copy_ids = {
+                correlation_id
+                for start, end, api_name, correlation_id in runtime
+                if correlation_id is not None
+                and "Memcpy" in api_name
+                and any(a <= start <= end <= b for a, b in prefetch_ranges)
+            }
+            prefetch_copies = [
+                copy for copy in copies if copy[3] == "Host-to-Device" and copy[4] in copy_ids
+            ]
+            prefetch_intervals = [(start, end) for start, end, _, _, _ in prefetch_copies]
+            student_ranges = [
+                (start, end)
+                for start, end, name in nvtx
+                if name == "openmopd::compute::student_log_prob"
+                and step_start <= start <= end <= step_end
+            ]
+            student_kernels = [
+                clipped
+                for kernel in kernels
+                for student in student_ranges
+                if (clipped := clip(kernel, student))
+            ]
+            print(
+                f"| `{step_name.removeprefix('openmopd::')}` | "
+                f"{sum(copy[2] for copy in prefetch_copies) / 2**20:.1f} | "
+                f"{ms(duration_ns(prefetch_intervals)):.3f} | "
+                f"{ms(intersection_ns(prefetch_intervals, student_ranges)):.3f} | "
+                f"{ms(intersection_ns(prefetch_intervals, student_kernels)):.3f} |"
+            )
+
     if len(steps) > 1:
         print("\n## Cross-step optimizer-offload overlap\n")
         print(

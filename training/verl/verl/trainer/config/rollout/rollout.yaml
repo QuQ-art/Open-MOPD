@@ -7,6 +7,15 @@ name: ???
 # sync: LLM, async: AsyncLLM
 mode: sync
 
+# Experiment: overlap one teacher FSDP1 shard HtoD with student log-prob compute.
+teacher_param_prefetch: false
+
+# Maximum extra GPU memory for the staged teacher shard, in MiB.
+teacher_param_prefetch_max_mb: 768
+
+# Single-GPU, single-micro-batch primary teacher forward / student overlap.
+teacher_forward_overlap: false
+
 # Sampling temperature for rollout.
 temperature: 1.0
 

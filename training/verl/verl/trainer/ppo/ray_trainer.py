@@ -642,6 +642,9 @@ class RayPPOTrainer:
         self.reward_mode = self.direct_opd_options["reward_mode"]
         self.use_delta_opd = self.reward_mode == "delta_opd"
         self.use_mt_opd = self.reward_mode == "mt_opd"
+        self.teacher_forward_overlap = self.config.actor_rollout_ref.rollout.get("teacher_forward_overlap", False)
+        if self.teacher_forward_overlap and (not self.use_mt_opd or not self.use_rm):
+            raise ValueError("teacher_forward_overlap currently requires MT-OPD with a reward model")
         # ExOPD combines the standard OPD reward with the Direct-OPD
         # teacher/reference gap, so it needs the same reference scorer as
         # delta_opd. lambda == 1 reduces it to plain opd_kl.
@@ -1964,15 +1967,6 @@ class RayPPOTrainer:
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
-                            with marked_timer("compute_log_prob", timing_raw, color="blue"):
-                                # First forward, get student top k ids and log probs
-                                print("First forward, get student top k ids and log probs")
-                                old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-
-                                # if "entropys" in old_log_prob.batch.keys():
-                                #    old_log_prob.batch.pop("entropys")
-                                batch = batch.union(old_log_prob)
-
                             # Get Top-K parameters from config
                             top_k = self.config.actor_rollout_ref.rollout.get("log_prob_top_k", 0)
                             strategy = self.config.actor_rollout_ref.rollout.get("top_k_strategy", "only_stu")
@@ -1995,9 +1989,18 @@ class RayPPOTrainer:
                             batch.meta_info["reward_mode"] = reward_mode
                             batch.meta_info["top_p_intersec_p"] = self.config.actor_rollout_ref.rollout.get("top_p_intersec_p", 0.99)
                             
-                            with marked_timer("compute_rm_score", timing_raw, color="magenta"):
-                                teacher_data = self.rm_wg.compute_rm_score(batch)
-                                batch = batch.union(teacher_data)
+                            scoring_timer = "compute_log_prob_and_teacher" if self.teacher_forward_overlap else "compute_log_prob"
+                            with marked_timer(scoring_timer, timing_raw, color="blue"):
+                                if self.teacher_forward_overlap:
+                                    scoring_output = self.actor_rollout_wg.compute_log_prob_and_teacher(batch)
+                                else:
+                                    scoring_output = self.actor_rollout_wg.compute_log_prob(batch)
+                                batch = batch.union(scoring_output)
+
+                            if not self.teacher_forward_overlap:
+                                with marked_timer("compute_rm_score", timing_raw, color="magenta"):
+                                    teacher_data = self.rm_wg.compute_rm_score(batch)
+                                    batch = batch.union(teacher_data)
 
                             if reward_mode in ("delta_opd", "exopd"):
                                 if self.teacher_ref_rm_wg is None:
