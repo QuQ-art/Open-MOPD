@@ -16,6 +16,17 @@ teacher_param_prefetch_max_mb: 768
 # Single-GPU, single-micro-batch primary teacher forward / student overlap.
 teacher_forward_overlap: false
 
+# Stage one Code (mt_rm_1) shard starting at the Math output projection.
+# Requires teacher_forward_overlap; bounded prefix, with a hard total staging cap.
+code_teacher_param_prefetch: false
+code_teacher_param_prefetch_handles: 1
+code_teacher_param_prefetch_max_mb: 768
+# output_head or math_h2d_done (wait for Math parameter DMA, not Math compute).
+code_teacher_param_prefetch_trigger: output_head
+
+# Reuse mask unpadding metadata only within one primary teacher forward.
+teacher_attention_metadata_cache: false
+
 # Sampling temperature for rollout.
 temperature: 1.0
 

@@ -198,6 +198,17 @@ class RolloutConfig(BaseConfig):
     # Initially restricted to single-GPU, single-micro-batch MT-OPD.
     teacher_forward_overlap: bool = False
 
+    # Stage the first Code (mt_rm_1) shard during the Math output projection/tail.
+    # Requires teacher_forward_overlap; bounds are independent of Math staging.
+    code_teacher_param_prefetch: bool = False
+    code_teacher_param_prefetch_handles: int = 1
+    code_teacher_param_prefetch_max_mb: int = 768
+    # math_h2d_done starts copies while Math layers still compute.
+    code_teacher_param_prefetch_trigger: str = "output_head"
+
+    # Reuse immutable mask unpadding metadata within one primary teacher forward.
+    teacher_attention_metadata_cache: bool = False
+
     # Diagnostic-only switch for a preloaded vLLM engine.  It leaves the
     # checkpoint-loaded weights untouched for the first rollout transition,
     # allowing validation to distinguish checkpoint loading from the online

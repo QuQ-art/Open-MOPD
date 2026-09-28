@@ -88,12 +88,13 @@ from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerCon
 from verl.utils.profiler.performance import reduce_timing, topk_reduce_ratio_min_max
 from verl.utils.py_functional import convert_to_regular_types
 from verl.utils.ray_utils import get_event_loop
+from verl.workers.attention_metadata import reuse_unpad_metadata
 from verl.workers.config import FSDPCriticConfig, FSDPEngineConfig, HFModelConfig, RolloutConfig
 from verl.workers.config.optimizer import build_optimizer
 from verl.workers.rollout import get_rollout_class
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
 from verl.workers.teacher_forward_overlap import TeacherForwardOverlap
-from verl.workers.teacher_param_prefetch import TeacherHandlePrefetch
+from verl.workers.teacher_param_prefetch import TeacherHandlePrefetch, after_teacher_parameter_copies
 
 _TEACHER_PREFETCH_POINT = "first_linear_pre"
 
@@ -1022,6 +1023,24 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 raise ValueError("teacher forward overlap requires a colocated primary reward worker")
             teacher.prepare_forward_overlap()
 
+        if self._is_actor and self.config.rollout.get("teacher_attention_metadata_cache", False):
+            teacher = self.get_fused_worker_by_name("rm")
+            if teacher is None or teacher.use_remove_padding or teacher.use_fused_kernels:
+                raise ValueError("attention metadata reuse requires a colocated padded, unfused primary teacher")
+            teacher._attention_metadata_cache_enabled = True
+
+        if self._is_actor and self.config.rollout.get("code_teacher_param_prefetch", False):
+            if not self.config.rollout.get("teacher_forward_overlap", False):
+                raise ValueError("Code parameter prefetch requires joint student/Math scoring")
+            code_teacher = self.get_fused_worker_by_name("mt_rm_1")
+            if code_teacher is None:
+                raise ValueError("Code parameter prefetch requires a colocated mt_rm_1 worker")
+            code_teacher.prepare_param_prefetch(
+                self.config.rollout.code_teacher_param_prefetch_max_mb,
+                nvtx_name="openmopd::io::h2d::code_teacher_prefetch",
+                num_handles=self.config.rollout.code_teacher_param_prefetch_handles,
+            )
+
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_update")
     def update_actor(self, data: DataProto):
@@ -1201,13 +1220,19 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         """Overlap model forwards; run unchanged teacher scoring after IDs are ready."""
         if not self.config.rollout.get("teacher_forward_overlap", False):
             raise ValueError("joint scoring requires teacher_forward_overlap=true")
-        if len(data) != 1 or self.config.rollout.log_prob_use_dynamic_bsz:
-            raise ValueError("teacher forward overlap currently requires one sample and fixed micro-batching")
+        if (
+            len(data) < 1
+            or self.config.rollout.log_prob_use_dynamic_bsz
+            or len(data) > self.config.rollout.log_prob_micro_batch_size_per_gpu
+        ):
+            raise ValueError("teacher forward overlap requires one nonempty fixed student micro-batch")
         if data.meta_info.get("reward_mode") != "mt_opd" or data.meta_info.get("log_prob_top_k", 0) <= 0:
             raise ValueError("teacher forward overlap currently requires MT-OPD with student top-k")
         if data.meta_info.get("is_lora", False):
             raise ValueError("teacher forward overlap does not support reference/adapter-disabled scoring")
         teacher = self.get_fused_worker_by_name("rm")
+        if len(data) > teacher.config.micro_batch_size_per_gpu:
+            raise ValueError("teacher forward overlap requires one matching teacher micro-batch")
         runner = teacher.prepare_forward_overlap()
         # Deserialized TensorDicts may retain consolidated-storage metadata.
         # Adding student tensors then calling .to() can reinterpret those tensors
@@ -1231,7 +1256,36 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     # pre_unshard consumption is not the last GPU use of the shard.
                     prefetch.stream.wait_event(runner.last_done)
                 prefetch.start()
-            runner.start(lambda: teacher._forward_model_logits(teacher_inputs.batch), inputs_ready)
+            runner.start(
+                lambda: teacher._forward_model_logits(
+                    teacher_inputs.batch,
+                    output_head_callback=(
+                        start_code_prefetch if code_prefetch is not None and code_trigger == "output_head" else None
+                    ),
+                    parameter_copy_callback=(
+                        start_code_prefetch if code_prefetch is not None and code_trigger == "math_h2d_done" else None
+                    ),
+                ),
+                inputs_ready,
+            )
+
+        code_prefetch = None
+        code_trigger = self.config.rollout.get("code_teacher_param_prefetch_trigger", "output_head")
+        if self.config.rollout.get("code_teacher_param_prefetch", False):
+            if code_trigger not in ("output_head", "math_h2d_done"):
+                raise ValueError("Code prefetch trigger must be output_head or math_h2d_done")
+            code_teacher = self.get_fused_worker_by_name("mt_rm_1")
+            if code_teacher is None or code_teacher._teacher_handle_prefetch is None:
+                raise ValueError("Code parameter staging must be prepared before scoring")
+            code_prefetch = code_teacher._teacher_handle_prefetch
+
+        def start_code_prefetch():
+            # The caller selects the Math compute stream (output head) or its
+            # pre-unshard stream after every parameter copy has been submitted.
+            ready = torch.cuda.Event()
+            ready.record(torch.cuda.current_stream())
+            code_prefetch.stream.wait_event(ready)
+            code_prefetch.start()
 
         with _openmopd_nvtx("compute::student_teacher_scoring"):
             try:
@@ -1249,6 +1303,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     runner.drain()
                 except BaseException:
                     logger.exception("Failed to drain teacher stream after joint scoring failure")
+                if code_prefetch is not None:
+                    try:
+                        code_prefetch.discard()
+                    except BaseException:
+                        logger.exception("Failed to drain Code parameter prefetch after scoring failure")
                 raise
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
@@ -2119,7 +2178,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         vocab_size = original_shape[-1]
         
         # Flatten to [-1, vocab_size]
-        logits_flat = logits.view(-1, vocab_size)
+        logits_flat = logits.reshape(-1, vocab_size)
         
         entropy_list = []
         for i in range(0, logits_flat.size(0), chunk_size):
@@ -2259,10 +2318,10 @@ class RewardModelWorker(Worker, DistProfilerExtension):
             or self.use_fused_kernels
             or self._do_switch_chat_template
             or self.config.use_dynamic_bsz
-            or self.config.micro_batch_size_per_gpu != 1
+            or self.config.micro_batch_size_per_gpu < 1
         ):
             raise ValueError(
-                "teacher forward overlap requires FSDP1, one GPU, SP=1, one-sample micro-batches, "
+                "teacher forward overlap requires FSDP1, one GPU, SP=1, a single fixed micro-batch, "
                 "and no dynamic batching, padding removal, fused kernels, or chat-template switching"
             )
         if self._teacher_forward_overlap is None:
@@ -2270,32 +2329,68 @@ class RewardModelWorker(Worker, DistProfilerExtension):
             self._teacher_forward_overlap = TeacherForwardOverlap(self.reward_module.compute_device, name)
         return self._teacher_forward_overlap
 
-    def _forward_model_logits(self, micro_batch):
-        """Padded-layout model call only; no dependency on student top-k IDs."""
+    def _forward_model_logits(self, micro_batch, output_head_callback=None, parameter_copy_callback=None):
+        """Padded model call with optional next-teacher staging at a selected boundary."""
         position_ids = micro_batch["position_ids"]
         if position_ids.dim() == 3:
             position_ids = position_ids.transpose(0, 1)
-        with torch.no_grad(), torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
-            output = self.reward_module(
-                input_ids=micro_batch["input_ids"],
-                attention_mask=micro_batch["attention_mask"],
-                position_ids=position_ids,
-                use_cache=False,
-                return_dict=self.use_fused_kernels,
-            )
-        return output[0] if isinstance(output, tuple) else output.logits
+        hook = None
+        calls = 0
+        if output_head_callback is not None:
+            head = self.reward_module.get_output_embeddings()
+            while isinstance(head, FSDP):
+                head = head.module
+            if not isinstance(head, torch.nn.Linear):
+                raise ValueError("Code tail prefetch requires a Linear Math output projection")
+
+            def before_output_head(module, args):
+                nonlocal calls
+                calls += 1
+                if calls != 1:
+                    raise RuntimeError("Math output projection ran more than once during Code prefetch")
+                output_head_callback()
+
+            hook = head.register_forward_pre_hook(before_output_head)
+        try:
+            with (
+                torch.no_grad(),
+                torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16),
+                reuse_unpad_metadata(getattr(self, "_attention_metadata_cache_enabled", False)) as metadata,
+                after_teacher_parameter_copies(self.reward_module, parameter_copy_callback),
+            ):
+                output = self.reward_module(
+                    input_ids=micro_batch["input_ids"],
+                    attention_mask=micro_batch["attention_mask"],
+                    position_ids=position_ids,
+                    use_cache=False,
+                    return_dict=self.use_fused_kernels,
+                )
+            if metadata is not None:
+                self._attention_metadata_cache_stats = {k: metadata[k] for k in ("hits", "misses")}
+            if output_head_callback is not None and calls != 1:
+                raise RuntimeError("Math output projection did not trigger Code prefetch")
+            return output[0] if isinstance(output, tuple) else output.logits
+        finally:
+            if hook is not None:
+                hook.remove()
 
     def start_param_prefetch(self, max_mb: int):
         """Enqueue one teacher local-shard HtoD before student computation."""
         self.prepare_param_prefetch(max_mb)
         self._teacher_handle_prefetch.start()
 
-    def prepare_param_prefetch(self, max_mb: int):
-        """Allocate the reusable teacher staging shard before training steps."""
+    def prepare_param_prefetch(self, max_mb: int, nvtx_name="openmopd::io::h2d::teacher_prefetch", num_handles=1):
+        """Allocate a bounded prefix of reusable staging shards before training."""
         if self._teacher_handle_prefetch is None:
-            self._teacher_handle_prefetch = TeacherHandlePrefetch(self.reward_module, max_mb=max_mb)
-        elif self._teacher_handle_prefetch.max_bytes != max_mb * 1024 * 1024:
-            raise ValueError("teacher parameter prefetch cap changed during training")
+            self._teacher_handle_prefetch = TeacherHandlePrefetch(
+                self.reward_module, max_mb=max_mb, nvtx_name=nvtx_name, num_handles=num_handles
+            )
+        elif (
+            self._teacher_handle_prefetch.max_bytes != max_mb * 1024 * 1024
+            or self._teacher_handle_prefetch.num_handles != num_handles
+            or self._teacher_handle_prefetch.nvtx_name != nvtx_name
+        ):
+            raise ValueError("teacher parameter prefetch configuration changed during training")
 
     def _forward_micro_batch(
         self,
@@ -2951,11 +3046,15 @@ class RewardModelWorker(Worker, DistProfilerExtension):
 
         if precomputed_logits is not None:
             self.prepare_forward_overlap()
-            if len(data) != 1 or precomputed_logits.shape[:2] != data.batch["input_ids"].shape:
+            if (
+                not 0 < len(data) <= self.config.micro_batch_size_per_gpu
+                or precomputed_logits.shape[:2] != data.batch["input_ids"].shape
+            ):
                 raise ValueError("precomputed teacher logits do not match the single input micro-batch")
 
         prefetch = getattr(self, "_teacher_handle_prefetch", None)
         previous_reuse_count = prefetch.reuse_count if prefetch is not None else None
+        had_pending_prefetch = prefetch is not None and prefetch.pending is not None
 
         # Support all hardwares
         with _openmopd_nvtx("io::h2d::teacher_inputs"):
@@ -3163,8 +3262,9 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         if self.world_size > 1 and fsdp_version(self.reward_module) == 1:
             self.reward_module._handle.reshard(True)
 
-        if prefetch is not None and prefetch.copy_count > previous_reuse_count:
+        if had_pending_prefetch:
             prefetch.assert_consumed(previous_reuse_count)
+            prefetch.record_use_done()
 
         # Keep on GPU to avoid expensive CPU-GPU transfer for large top-k data
         # output = output.to("cpu")
