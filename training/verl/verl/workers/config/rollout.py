@@ -209,6 +209,12 @@ class RolloutConfig(BaseConfig):
     # Reuse immutable mask unpadding metadata within one primary teacher forward.
     teacher_attention_metadata_cache: bool = False
 
+    # Retain optimizer state through rollout preparation, then offload during generation.
+    # Requires room for both optimizer and rollout KV, plus pinned CPU buffers.
+    optimizer_offload_overlap: bool = False
+    # One bounded D2H chunk in flight avoids blocking rollout token transfers.
+    optimizer_offload_overlap_chunk_mb: int = 32
+
     # Diagnostic-only switch for a preloaded vLLM engine.  It leaves the
     # checkpoint-loaded weights untouched for the first rollout transition,
     # allowing validation to distinguish checkpoint loading from the online

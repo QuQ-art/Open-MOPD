@@ -508,7 +508,9 @@ class vLLMRollout(BaseRollout):
 
         kwargs = dict(
             n=1,
-            logprobs=0,  # can be set to 0 and let actor to recompute
+            # Zero still requests the sampled token's logprob and CPU readback.
+            # Skip it when the actor recomputes logprobs and rollout discards them.
+            logprobs=0 if config.calculate_log_probs else None,
             max_tokens=config.response_length,
             repetition_penalty=config.get("repetition_penalty", 1.0),
         )
@@ -697,7 +699,6 @@ class vLLMRollout(BaseRollout):
                 use_tqdm=False,
             )
 
-            # TODO(sgm): disable logprob when recompute_log_prob is enable
             # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
 
             response = []

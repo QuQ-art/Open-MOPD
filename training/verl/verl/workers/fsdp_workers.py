@@ -91,6 +91,7 @@ from verl.utils.ray_utils import get_event_loop
 from verl.workers.attention_metadata import reuse_unpad_metadata
 from verl.workers.config import FSDPCriticConfig, FSDPEngineConfig, HFModelConfig, RolloutConfig
 from verl.workers.config.optimizer import build_optimizer
+from verl.workers.optimizer_offload_overlap import OptimizerOffloadOverlap
 from verl.workers.rollout import get_rollout_class
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
 from verl.workers.teacher_forward_overlap import TeacherForwardOverlap
@@ -275,6 +276,26 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         elif self._is_ref:
             # TODO: it seems that manual offload is slowly than FSDP offload
             self._is_offload_param = self.config.ref.fsdp_config.get("param_offload", False)
+
+        self._optimizer_offload_overlap = None
+        if self.config.rollout.get("optimizer_offload_overlap", False):
+            if (
+                not (self._is_actor and self._is_rollout and self._is_offload_optimizer)
+                or world_size != 1
+                or device_name != "cuda"
+                or self.config.actor.strategy != "fsdp"
+                or self.config.rollout.name != "vllm"
+                or self.config.rollout.mode != "sync"
+                or self._is_offload_param
+            ):
+                raise ValueError(
+                    "optimizer_offload_overlap requires single-GPU FSDP1 actor/sync vLLM, "
+                    "optimizer_offload=True and param_offload=False"
+                )
+            self._optimizer_offload_overlap = OptimizerOffloadOverlap(
+                torch.device("cuda", torch.cuda.current_device()),
+                chunk_mb=self.config.rollout.get("optimizer_offload_overlap_chunk_mb", 32),
+            )
 
         # normalize config
         if self._is_actor:
@@ -876,8 +897,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.torch_random_states = get_torch_device().get_rng_state()
         get_torch_device().set_rng_state(self.gen_random_states)
 
+    def _finish_optimizer_offload(self):
+        overlap = getattr(self, "_optimizer_offload_overlap", None)
+        if overlap is not None:
+            overlap.finish()
+
     async def trainer_mode(self):
         """Context switch hybridengine to trainer mode."""
+        self._finish_optimizer_offload()
         if self.config.rollout.free_cache_engine:
             log_gpu_memory_usage("Before rollout offload", logger=logger)
             with _openmopd_nvtx("memory::vllm_release"):
@@ -1045,6 +1072,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="red", role="actor_update")
     def update_actor(self, data: DataProto):
         assert self._is_actor
+        self._finish_optimizer_offload()
         if self._is_offload_param:
             with _openmopd_nvtx("io::h2d::actor_parameters_for_update"):
                 load_fsdp_model_to_gpu(self.actor_module_fsdp)
@@ -1084,9 +1112,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 offload_fsdp_model_to_cpu(self.actor_module_fsdp)
             log_gpu_memory_usage("After offload actor model during update_actor", logger=logger)
         if self._is_offload_optimizer:
-            with _openmopd_nvtx("io::d2h::optimizer_state"):
-                offload_fsdp_optimizer(optimizer=self.actor_optimizer)
-            log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
+            if self._optimizer_offload_overlap is not None:
+                with _openmopd_nvtx("memory::prepare_optimizer_offload"):
+                    self._optimizer_offload_overlap.prepare(self.actor_optimizer)
+            else:
+                with _openmopd_nvtx("io::d2h::optimizer_state"):
+                    offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+            log_gpu_memory_usage("After preparing actor optimizer offload during update_actor", logger=logger)
 
         return output
 
@@ -1115,8 +1147,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             log_gpu_memory_usage("After switch to rollout mode", logger=logger)
 
         with simple_timer("generate_sequences", timing_generate):
-            with _openmopd_nvtx("compute::student_rollout"):
-                output = self.rollout.generate_sequences(prompts=prompts)
+            try:
+                with _openmopd_nvtx("compute::student_rollout"):
+                    # All cache clearing, weight sync and KV wake must precede
+                    # this enqueue: those operations can synchronize CUDA.
+                    if self._optimizer_offload_overlap is not None:
+                        self._optimizer_offload_overlap.start()
+                    output = self.rollout.generate_sequences(prompts=prompts)
+            finally:
+                self._finish_optimizer_offload()
 
         if self._is_actor:
             loop.run_until_complete(self.trainer_mode())
@@ -1454,6 +1493,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # only support save and load ckpt for actor
         assert self._is_actor
+        self._finish_optimizer_offload()
 
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
@@ -1504,6 +1544,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             f"{self._is_actor} and {self._is_rollout}"
         )
 
+        self._finish_optimizer_offload()
         # No checkpoint to load, just offload the model and optimizer to CPU
         if local_path is None:
             if self._is_offload_param:
@@ -1549,6 +1590,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             # Keep the final step's asynchronous offloads inside the capture,
             # without inserting a synchronization between consecutive steps.
             with _openmopd_nvtx("io::drain_pending_cuda"):
+                self._finish_optimizer_offload()
                 torch.cuda.synchronize()
         torch.cuda.nvtx.range_pop()
         self._openmopd_step_range_active = False

@@ -27,6 +27,13 @@ code_teacher_param_prefetch_trigger: output_head
 # Reuse mask unpadding metadata only within one primary teacher forward.
 teacher_attention_metadata_cache: false
 
+# Single-GPU sync vLLM: overlap optimizer D2H with generation after weights/KV wake.
+# GPU must fit optimizer AND rollout KV; lower gpu_memory_utilization if needed.
+# Also retains one pinned CPU copy of optimizer state.
+optimizer_offload_overlap: false
+# Bound each DMA and keep only one in flight so rollout token copies can interleave.
+optimizer_offload_overlap_chunk_mb: 32
+
 # Sampling temperature for rollout.
 temperature: 1.0
 

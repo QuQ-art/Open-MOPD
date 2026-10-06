@@ -48,29 +48,31 @@ class TestTeacherParamPrefetch(unittest.TestCase):
 
                 prefetch = TeacherHandlePrefetch(model, max_mb=1)
                 original_calls = 0
-                original = prefetch.original_pre_unshard
+                original = prefetch.original_pre_unshards[0]
 
                 def counted_original():
                     nonlocal original_calls
                     original_calls += 1
                     return original()
 
-                prefetch.original_pre_unshard = counted_original
+                prefetch.original_pre_unshards[0] = counted_original
                 staged_ptr = prefetch.staged.data_ptr()
                 prefetch.start()
                 self.assertIsNotNone(prefetch.pending)
-                self.assertEqual(prefetch.pending[0].data_ptr(), staged_ptr)
+                self.assertEqual(prefetch.buffers[0].data_ptr(), staged_ptr)
                 with torch.no_grad():
                     result = model(x)
                 prefetch.assert_consumed(previous_reuse_count=0)
+                prefetch.record_use_done()
                 torch.testing.assert_close(result, baseline)
                 self.assertEqual(original_calls, 0)  # no second HtoD through FSDP pre_unshard
 
                 prefetch.start()
-                self.assertEqual(prefetch.pending[0].data_ptr(), staged_ptr)
+                self.assertEqual(prefetch.buffers[0].data_ptr(), staged_ptr)
                 with torch.no_grad():
                     result = model(x)
                 prefetch.assert_consumed(previous_reuse_count=1)
+                prefetch.record_use_done()
                 torch.testing.assert_close(result, baseline)
                 self.assertEqual(original_calls, 0)
 
