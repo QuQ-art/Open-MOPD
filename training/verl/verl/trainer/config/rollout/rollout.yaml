@@ -7,22 +7,14 @@ name: ???
 # sync: LLM, async: AsyncLLM
 mode: sync
 
-# Experiment: overlap one teacher FSDP1 shard HtoD with student log-prob compute.
+# One switch: Math HtoD during student log-probs, Code HtoD during Math forward.
+# Model forwards remain sequential. Requires colocated Math and Code, single GPU.
 teacher_param_prefetch: false
-
-# Maximum extra GPU memory for the staged teacher shard, in MiB.
+# Both teachers stage bounded prefixes. Caps are independent (MiB).
+teacher_param_prefetch_handles: 1
 teacher_param_prefetch_max_mb: 768
-
-# Single-GPU, single-micro-batch primary teacher forward / student overlap.
-teacher_forward_overlap: false
-
-# Stage one Code (mt_rm_1) shard starting at the Math output projection.
-# Requires teacher_forward_overlap; bounded prefix, with a hard total staging cap.
-code_teacher_param_prefetch: false
 code_teacher_param_prefetch_handles: 1
 code_teacher_param_prefetch_max_mb: 768
-# output_head or math_h2d_done (wait for Math parameter DMA, not Math compute).
-code_teacher_param_prefetch_trigger: output_head
 
 # Reuse mask unpadding metadata only within one primary teacher forward.
 teacher_attention_metadata_cache: false

@@ -38,13 +38,19 @@ def bind(target, cls, names):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--student', required=True)
-    parser.add_argument('--teacher', required=True)
+    parser.add_argument('--teacher', required=True, help='Math checkpoint')
+    parser.add_argument('--code-teacher', required=True)
+    parser.add_argument('--batch-size', type=int, default=4)
+    parser.add_argument('--math-handles', type=int, default=37)
+    parser.add_argument('--math-max-mb', type=int, default=6144)
+    parser.add_argument('--code-handles', type=int, default=37)
+    parser.add_argument('--code-max-mb', type=int, default=6144)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--pairs', type=int, default=8)
     parser.add_argument('--sequence-length', type=int, default=1248)
     parser.add_argument('--response-length', type=int, default=1024)
     args = parser.parse_args()
-    if args.pairs < 1 or not 0 < args.response_length < args.sequence_length:
+    if args.batch_size < 1 or args.pairs < 1 or not 0 < args.response_length < args.sequence_length:
         parser.error('require positive pairs and 0 < response-length < sequence-length')
     torch.cuda.set_device(0)
     torch.manual_seed(31)
@@ -72,33 +78,48 @@ def main():
             teacher = SimpleNamespace(
                 reward_module=teacher_model, use_remove_padding=False, use_fused_kernels=False,
                 _do_switch_chat_template=False, world_size=1, ulysses_sequence_parallel_size=1,
-                ulysses_sharding_manager=nullcontext(), _teacher_forward_overlap=None, _teacher_handle_prefetch=None,
-                config=OmegaConf.create({'use_dynamic_bsz': False, 'micro_batch_size_per_gpu': 1,
+                ulysses_sharding_manager=nullcontext(), _next_teacher_prefetch=None, _teacher_handle_prefetch=None,
+                config=OmegaConf.create({'use_dynamic_bsz': False, 'micro_batch_size_per_gpu': args.batch_size,
                                          'model': {'path': args.teacher}}),
             )
             bind(teacher, RewardModelWorker, (
                 '_forward_model_logits', '_forward_micro_batch', '_compute_entropy_safe',
-                '_compute_teacher_top_k_log_probs', 'prepare_forward_overlap', '_compute_rm_score',
+                '_compute_teacher_top_k_log_probs', '_compute_rm_score', '_compute_rm_score_impl',
                 'prepare_param_prefetch', 'start_param_prefetch',
             ))
-            teacher.prepare_param_prefetch(768)
+            code = SimpleNamespace(
+                reward_module=load(args.code_teacher, True), use_remove_padding=False, use_fused_kernels=False,
+                _do_switch_chat_template=False, world_size=1, ulysses_sequence_parallel_size=1,
+                ulysses_sharding_manager=nullcontext(), _next_teacher_prefetch=None, _teacher_handle_prefetch=None,
+                config=OmegaConf.create({'use_dynamic_bsz': False, 'micro_batch_size_per_gpu': args.batch_size,
+                                         'model': {'path': args.code_teacher}}),
+            )
+            bind(code, RewardModelWorker, (
+                '_forward_model_logits', '_forward_micro_batch', '_compute_entropy_safe',
+                '_compute_teacher_top_k_log_probs', '_compute_rm_score', '_compute_rm_score_impl',
+                'prepare_param_prefetch', 'start_param_prefetch',
+            ))
             worker = SimpleNamespace(
-                actor=actor, _is_actor=True, _is_offload_param=False, world_size=1,
-                ulysses_sharding_manager=nullcontext(), get_fused_worker_by_name=lambda name: teacher,
+                actor=actor, _is_actor=True, _is_offload_param=False, world_size=1, ulysses_sequence_parallel_size=1,
+                ulysses_sharding_manager=nullcontext(), get_fused_worker_by_name=lambda name: {'rm': teacher, 'mt_rm_1': code}[name],
                 config=OmegaConf.create({'rollout': {
-                    'teacher_forward_overlap': True, 'teacher_param_prefetch': True,
-                    'teacher_param_prefetch_max_mb': 768, 'log_prob_micro_batch_size_per_gpu': 1,
+                    'teacher_param_prefetch': True,
+                    'code_teacher_param_prefetch_handles': args.code_handles,
+                    'code_teacher_param_prefetch_max_mb': args.code_max_mb,
+                    'teacher_param_prefetch_handles': args.math_handles,
+                    'teacher_param_prefetch_max_mb': args.math_max_mb, 'log_prob_micro_batch_size_per_gpu': args.batch_size,
                     'log_prob_max_token_len_per_gpu': args.sequence_length, 'log_prob_use_dynamic_bsz': False,
                     'temperature': 1.0, 'log_prob_top_k': 256,
                 }}),
             )
-            bind(worker, ActorRolloutRefWorker, ('_compute_log_prob', 'compute_log_prob_and_teacher'))
-            inputs = torch.randint(0, student_model.config.vocab_size, (1, args.sequence_length))
+            bind(worker, ActorRolloutRefWorker, ('compute_log_prob', '_compute_log_prob', '_prepare_teacher_prefetch'))
+            worker._prepare_teacher_prefetch()
+            inputs = torch.randint(0, student_model.config.vocab_size, (args.batch_size, args.sequence_length))
             source = DataProto.from_dict({
                 'input_ids': inputs, 'responses': inputs[:, -args.response_length:].clone(),
                 'attention_mask': torch.ones_like(inputs),
-                'position_ids': torch.arange(args.sequence_length).unsqueeze(0),
-                'response_mask': torch.ones(1, args.response_length, dtype=torch.long),
+                'position_ids': torch.arange(args.sequence_length).unsqueeze(0).expand(args.batch_size, -1).clone(),
+                'response_mask': torch.ones(args.batch_size, args.response_length, dtype=torch.long),
             }, meta_info={'reward_mode': 'mt_opd', 'log_prob_top_k': 256, 'top_k_strategy': 'only_stu'})
             serialized = pickle.dumps(source)
 
@@ -109,28 +130,29 @@ def main():
                 torch.cuda.empty_cache()
                 torch.cuda.reset_peak_memory_stats()
                 started = time.perf_counter()
-                if mode == 'overlap':
-                    out = worker.compute_log_prob_and_teacher(data)
-                else:
-                    data = DataProto.from_dict(dict(data.batch.items()), meta_info=dict(data.meta_info))
-                    student = worker._compute_log_prob(data)
-                    data.union(student)
-                    out = student.union(teacher._compute_rm_score(data))
+                worker.config.rollout.teacher_param_prefetch = mode == 'prefetch'
+                teacher._next_teacher_prefetch = code._teacher_handle_prefetch if mode == 'prefetch' else None
+                data = DataProto.from_dict(dict(data.batch.items()), meta_info=dict(data.meta_info))
+                student = worker.compute_log_prob(data)
+                data.union(student)
+                out = student.union(teacher._compute_rm_score(data))
+                code_out = code._compute_rm_score(data)
                 torch.cuda.synchronize()
                 elapsed = (time.perf_counter() - started) * 1000
                 memory = {name: getattr(torch.cuda, name)() / 2**30
                           for name in ('max_memory_allocated', 'max_memory_reserved')}
                 # Materialize only after the measured GPU-completion boundary.
                 tensors = {key: value.detach().cpu().clone() for key, value in out.batch.items()}
+                tensors.update({f'code_{key}': value.detach().cpu().clone() for key, value in code_out.batch.items()})
                 return tensors, {'mode': mode, 'elapsed_ms': elapsed, 'memory_GiB': memory}
 
             reference, _ = score('serial')
-            warm, _ = score('overlap')
+            warm, _ = score('prefetch')
             for key in reference:
                 torch.testing.assert_close(warm[key], reference[key], rtol=0, atol=0)
             records = []
             for pair in range(args.pairs):
-                for mode in (('serial', 'overlap') if pair % 2 == 0 else ('overlap', 'serial')):
+                for mode in (('serial', 'prefetch') if pair % 2 == 0 else ('prefetch', 'serial')):
                     actual, record = score(mode)
                     for key in reference:
                         torch.testing.assert_close(actual[key], reference[key], rtol=0, atol=0)
@@ -143,11 +165,11 @@ def main():
                                                 for r in records if r['mode'] == mode),
                        'peak_reserved_GiB': max(r['memory_GiB']['max_memory_reserved']
                                                for r in records if r['mode'] == mode)}
-                for mode in ('serial', 'overlap')
+                for mode in ('serial', 'prefetch')
             }
-            result = {'scope': 'local fixed-input scoring; frozen checkpoints; no Ray, rollout, Code teacher or update',
+            result = {'scope': 'local fixed-input scoring; frozen checkpoints; sequential student/Math/Code; no Ray, rollout or update',
                       'synthetic_input': True, 'sequence_length': args.sequence_length,
-                      'response_length': args.response_length, 'student': args.student, 'teacher': args.teacher,
+                      'response_length': args.response_length, 'batch_size': args.batch_size, 'code_teacher': args.code_teacher, 'student': args.student, 'teacher': args.teacher,
                       'gpu': torch.cuda.get_device_name(), 'torch': torch.__version__,
                       'cuda_environment': {key: os.environ.get(key) for key in (
                           'CUDA_DEVICE_MAX_CONNECTIONS', 'CUDA_DEVICE_MAX_COPY_CONNECTIONS',
@@ -159,13 +181,13 @@ def main():
                       },
                       'checked_output_keys': sorted(reference), 'records': records, 'summary': summary,
                       'copy_count': teacher._teacher_handle_prefetch.copy_count,
-                      'reuse_count': teacher._teacher_handle_prefetch.reuse_count}
+                      'reuse_count': teacher._teacher_handle_prefetch.reuse_count,
+                      'code_copy_count': code._teacher_handle_prefetch.copy_count,
+                      'code_reuse_count': code._teacher_handle_prefetch.reuse_count}
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(json.dumps(result, indent=2) + '\n')
             print(json.dumps(summary, indent=2), flush=True)
         finally:
-            if teacher is not None and teacher._teacher_forward_overlap is not None:
-                teacher._teacher_forward_overlap.close()
             dist.destroy_process_group()
 
 

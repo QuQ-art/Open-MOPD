@@ -188,23 +188,13 @@ class RolloutConfig(BaseConfig):
     # optimizer updates are visible without actor -> rollout weight copies.
     share_weights: bool = False
 
-    # Stage one teacher FSDP1 CPU shard during student log-prob computation.
+    # One switch: Math HtoD during student log-probs, Code HtoD during Math forward.
+    # Model forwards remain sequential. Both teachers stage configurable bounded prefixes.
     teacher_param_prefetch: bool = False
-
-    # Hard bound on the extra resident teacher shard while student computes.
+    teacher_param_prefetch_handles: int = 1
     teacher_param_prefetch_max_mb: int = 768
-
-    # Stage two: overlap one primary teacher model forward with student scoring.
-    # Initially restricted to single-GPU, single-micro-batch MT-OPD.
-    teacher_forward_overlap: bool = False
-
-    # Stage the first Code (mt_rm_1) shard during the Math output projection/tail.
-    # Requires teacher_forward_overlap; bounds are independent of Math staging.
-    code_teacher_param_prefetch: bool = False
     code_teacher_param_prefetch_handles: int = 1
     code_teacher_param_prefetch_max_mb: int = 768
-    # math_h2d_done starts copies while Math layers still compute.
-    code_teacher_param_prefetch_trigger: str = "output_head"
 
     # Reuse immutable mask unpadding metadata within one primary teacher forward.
     teacher_attention_metadata_cache: bool = False

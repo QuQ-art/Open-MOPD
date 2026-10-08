@@ -11,20 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import ast
 import pickle
 import tempfile
-import threading
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
 from types import MethodType, SimpleNamespace
+from unittest.mock import Mock, patch
 
 import torch
 import torch.distributed as dist
 from torch.distributed.fsdp import CPUOffload, FullyShardedDataParallel as FSDP
 
-from verl.workers.teacher_forward_overlap import TeacherForwardOverlap
-from verl.workers.teacher_param_prefetch import TeacherHandlePrefetch, after_teacher_parameter_copies
 
 
 class TinyLM(torch.nn.Module):
@@ -43,9 +42,92 @@ class TinyLM(torch.nn.Module):
         return (logits,) if kwargs.get("return_dict") is False else SimpleNamespace(logits=logits)
 
 
+def worker_method(class_name, method_name):
+    """Load a production control method without initializing Ray/vLLM/CUDA."""
+    source = Path(__file__).parents[2] / "verl/workers/fsdp_workers.py"
+    tree = ast.parse(source.read_text())
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == class_name)
+    method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == method_name)
+    method.decorator_list = []
+    namespace = {"DataProto": object, "torch": torch}
+    exec(compile(ast.Module(body=[method], type_ignores=[]), str(source), "exec"), namespace)
+    return namespace[method_name]
+
+
+class TestTeacherPrefetchControl(unittest.TestCase):
+    def test_initialization_wires_both_teachers_without_forward(self):
+        teacher = SimpleNamespace(use_remove_padding=False, use_fused_kernels=False,
+                                  prepare_param_prefetch=Mock(), forward=Mock())
+        code = SimpleNamespace(prepare_param_prefetch=Mock(), _teacher_handle_prefetch=object(), forward=Mock())
+        config = SimpleNamespace(teacher_param_prefetch_max_mb=6144, teacher_param_prefetch_handles=37,
+                                 code_teacher_param_prefetch_max_mb=6144, code_teacher_param_prefetch_handles=37)
+        worker = SimpleNamespace(world_size=1, ulysses_sequence_parallel_size=1,
+                                 config=SimpleNamespace(rollout=config),
+                                 get_fused_worker_by_name=lambda name: {"rm": teacher, "mt_rm_1": code}[name])
+        prepare = worker_method("ActorRolloutRefWorker", "_prepare_teacher_prefetch")
+        prepare(worker)
+        teacher.prepare_param_prefetch.assert_called_once_with(6144, num_handles=37)
+        code.prepare_param_prefetch.assert_called_once_with(
+            6144, nvtx_name="openmopd::io::h2d::code_teacher_prefetch", num_handles=37)
+        self.assertIs(teacher._next_teacher_prefetch, code._teacher_handle_prefetch)
+        teacher.forward.assert_not_called()
+        code.forward.assert_not_called()
+        worker.get_fused_worker_by_name = lambda name: teacher if name == "rm" else None
+        with self.assertRaisesRegex(ValueError, "colocated Math and Code"):
+            prepare(worker)
+
+    def test_repeated_math_start_preserves_full_prefetch_configuration(self):
+        prefetch = SimpleNamespace(max_bytes=6144 * 1024 * 1024, num_handles=37,
+                                   nvtx_name="openmopd::io::h2d::teacher_prefetch", start=Mock())
+        worker = SimpleNamespace(_teacher_handle_prefetch=prefetch)
+        worker.prepare_param_prefetch = MethodType(
+            worker_method("RewardModelWorker", "prepare_param_prefetch"), worker)
+        start = worker_method("RewardModelWorker", "start_param_prefetch")
+        for _ in range(2):
+            start(worker, 6144, num_handles=37)
+        self.assertEqual(prefetch.start.call_count, 2)
+        with self.assertRaisesRegex(ValueError, "configuration changed"):
+            start(worker, 6144, num_handles=1)
+        self.assertEqual(prefetch.start.call_count, 2)
+
+    def test_student_failure_discards_only_enabled_prefetch(self):
+        prefetch = Mock()
+        worker = SimpleNamespace(config=SimpleNamespace(rollout={"teacher_param_prefetch": True}),
+                                 get_fused_worker_by_name=lambda name: SimpleNamespace(_teacher_handle_prefetch=prefetch),
+                                 _compute_log_prob=Mock(side_effect=RuntimeError("student failed")))
+        score = worker_method("ActorRolloutRefWorker", "compute_log_prob")
+        with self.assertRaisesRegex(RuntimeError, "student failed"):
+            score(worker, object())
+        prefetch.discard.assert_called_once()
+        prefetch.reset_mock()
+        worker.config.rollout["teacher_param_prefetch"] = False
+        with self.assertRaisesRegex(RuntimeError, "student failed"):
+            score(worker, object())
+        prefetch.discard.assert_not_called()
+
+    def test_math_failure_drains_both_and_preserves_error(self):
+        order = []
+        worker = SimpleNamespace(
+            _teacher_handle_prefetch=SimpleNamespace(discard=lambda: order.append("math")),
+            _next_teacher_prefetch=SimpleNamespace(discard=lambda: order.append("code")),
+            _compute_rm_score_impl=Mock(side_effect=ValueError("postprocess failed")))
+        score = worker_method("RewardModelWorker", "_compute_rm_score")
+        with patch.object(torch.cuda, "synchronize", side_effect=lambda: order.append("drain")):
+            with self.assertRaisesRegex(ValueError, "postprocess failed"):
+                score(worker, object())
+        self.assertEqual(order, ["drain", "math", "code"])
+        worker._teacher_handle_prefetch = worker._next_teacher_prefetch = None
+        with patch.object(torch.cuda, "synchronize") as synchronize:
+            with self.assertRaisesRegex(ValueError, "postprocess failed"):
+                score(worker, object())
+            synchronize.assert_not_called()
+
+
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
-class TestTeacherForwardOverlap(unittest.TestCase):
+class TestTeacherPrefetchPipeline(unittest.TestCase):
     def test_bounded_prefix_reuse_discard_and_cap(self):
+        from verl.workers.teacher_param_prefetch import TeacherHandlePrefetch
+
         with tempfile.TemporaryDirectory() as directory:
             dist.init_process_group("nccl", init_method=Path(directory, "init").as_uri(), rank=0, world_size=1)
             try:
@@ -90,6 +172,8 @@ class TestTeacherForwardOverlap(unittest.TestCase):
                 dist.destroy_process_group()
 
     def test_parameter_copy_trigger_stream_and_cleanup(self):
+        from verl.workers.teacher_param_prefetch import after_teacher_parameter_copies
+
         with tempfile.TemporaryDirectory() as directory:
             dist.init_process_group("nccl", init_method=Path(directory, "init").as_uri(), rank=0, world_size=1)
             try:
@@ -131,7 +215,9 @@ class TestTeacherForwardOverlap(unittest.TestCase):
             finally:
                 dist.destroy_process_group()
 
-    def test_joint_worker_matches_serial_and_serialization(self):
+    def test_sequential_workers_match_serial_and_serialization(self):
+        from verl.workers.teacher_param_prefetch import TeacherHandlePrefetch
+
         from omegaconf import OmegaConf
         from verl import DataProto
         from verl.workers.actor.dp_actor import DataParallelPPOActor
@@ -156,11 +242,11 @@ class TestTeacherForwardOverlap(unittest.TestCase):
                 teacher = SimpleNamespace(
                     reward_module=teacher_model, use_remove_padding=False, use_fused_kernels=False,
                     _do_switch_chat_template=False, world_size=1, ulysses_sequence_parallel_size=1,
-                    ulysses_sharding_manager=nullcontext(), _teacher_forward_overlap=None, config=teacher_config,
+                    ulysses_sharding_manager=nullcontext(), config=teacher_config,
                 )
                 for name in ("_forward_model_logits", "_forward_micro_batch", "_compute_entropy_safe",
-                             "_compute_teacher_top_k_log_probs", "prepare_forward_overlap", "compute_rm_score",
-                             "_compute_rm_score"):
+                             "_compute_teacher_top_k_log_probs", "prepare_param_prefetch", "start_param_prefetch", "compute_rm_score",
+                             "_compute_rm_score", "_compute_rm_score_impl"):
                     setattr(teacher, name, MethodType(getattr(RewardModelWorker, name), teacher))
                 teacher._teacher_handle_prefetch = TeacherHandlePrefetch(teacher_model, max_mb=1)
                 code = SimpleNamespace(
@@ -172,12 +258,12 @@ class TestTeacherForwardOverlap(unittest.TestCase):
                                              "model": {"path": "Code"}}),
                 )
                 for name in ("_forward_model_logits", "_forward_micro_batch", "_compute_entropy_safe",
-                             "_compute_teacher_top_k_log_probs", "_compute_rm_score"):
+                             "_compute_teacher_top_k_log_probs", "_compute_rm_score", "_compute_rm_score_impl"):
                     setattr(code, name, MethodType(getattr(RewardModelWorker, name), code))
                 code._teacher_handle_prefetch = TeacherHandlePrefetch(
                     code.reward_module, max_mb=1, nvtx_name="openmopd::io::h2d::code_teacher_prefetch")
                 worker_config = OmegaConf.create({"rollout": {
-                    "teacher_forward_overlap": True, "teacher_param_prefetch": True, "code_teacher_param_prefetch": True,
+                    "teacher_param_prefetch": False, "teacher_param_prefetch_max_mb": 1, "teacher_param_prefetch_handles": 1,
                     "log_prob_micro_batch_size_per_gpu": 2, "log_prob_max_token_len_per_gpu": 8,
                     "log_prob_use_dynamic_bsz": False, "temperature": 1.0, "log_prob_top_k": 4,
                 }})
@@ -186,7 +272,7 @@ class TestTeacherForwardOverlap(unittest.TestCase):
                     ulysses_sharding_manager=nullcontext(), get_fused_worker_by_name=lambda name: {"rm": teacher, "mt_rm_1": code}[name],
                     config=worker_config,
                 )
-                for name in ("compute_log_prob", "_compute_log_prob", "compute_log_prob_and_teacher"):
+                for name in ("compute_log_prob", "_compute_log_prob", "_prepare_teacher_prefetch"):
                     setattr(worker, name, MethodType(getattr(ActorRolloutRefWorker, name), worker))
                 inputs = torch.randint(0, 64, (2, 8))
 
@@ -204,149 +290,72 @@ class TestTeacherForwardOverlap(unittest.TestCase):
                 # Construct the serial reference independently of the joint
                 # container path, retaining the correct student IDs.
                 reference_data = DataProto.from_dict(dict(original.batch.items()), meta_info=dict(original.meta_info))
-                student = worker._compute_log_prob(reference_data, teacher_forward_callback=lambda: None)
+                student = worker._compute_log_prob(reference_data)
                 reference_data.union(student)
                 expected = student.union(teacher.compute_rm_score(reference_data)).batch.cpu()
                 code_expected = code._compute_rm_score(reference_data).batch.cpu()
-                for trigger in ("output_head", "math_h2d_done"):
-                    worker.config.rollout.code_teacher_param_prefetch_trigger = trigger
-                    actual = worker.compute_log_prob_and_teacher(batch())
-                    # Match the real worker boundary as well as the direct outputs.
+                worker.config.rollout.teacher_param_prefetch = True
+                teacher._next_teacher_prefetch = code._teacher_handle_prefetch
+                order = []
+                original_student_forward = student_model.module.forward
+                original_math_forward = teacher_model.module.forward
+
+                def student_forward(*args, **kwargs):
+                    order.append("student")
+                    return original_student_forward(*args, **kwargs)
+
+                def math_forward(*args, **kwargs):
+                    self.assertEqual(order[-1], "student_done")
+                    return original_math_forward(*args, **kwargs)
+
+                student_model.module.forward = student_forward
+                teacher_model.module.forward = math_forward
+
+                def score():
+                    data = batch()
+                    # Same separate RPC order as the trainer, with no joint forward.
+                    student_result = worker.compute_log_prob(data)
+                    order.append("student_done")
+                    self.assertIsNotNone(teacher._teacher_handle_prefetch.pending)
+                    result = student_result.union(teacher.compute_rm_score(data.union(student_result)))
+                    self.assertIsNotNone(code._teacher_handle_prefetch.pending)
+                    return result
+
+                for _ in range(2):
+                    actual = score()
                     restored = pickle.loads(pickle.dumps(actual))
                     for key in expected.keys():
-                        torch.testing.assert_close(actual.batch[key].cpu(), expected[key], rtol=0, atol=0)
-                        torch.testing.assert_close(restored.batch[key].cpu(), expected[key], rtol=0, atol=0)
-                    code_data = DataProto.from_dict(dict(batch().batch.items()), meta_info=dict(actual.meta_info))
-                    code_data.meta_info.update(reward_mode="mt_opd", log_prob_top_k=4)
-                    code_actual = code._compute_rm_score(code_data.union(actual))
+                        torch.testing.assert_close(actual.batch[key].cpu(), expected[key], rtol=0, atol=0, msg=key)
+                        torch.testing.assert_close(restored.batch[key].cpu(), expected[key], rtol=0, atol=0, msg=key)
+                    code_data = batch().union(actual)
+                    code_actual = code._compute_rm_score(code_data)
                     for key in code_expected.keys():
-                        torch.testing.assert_close(code_actual.batch[key].cpu(), code_expected[key], rtol=0, atol=0)
+                        torch.testing.assert_close(code_actual.batch[key].cpu(), code_expected[key], rtol=0, atol=0, msg=key)
                 self.assertEqual(code._teacher_handle_prefetch.copy_count, 2)
                 self.assertEqual(code._teacher_handle_prefetch.reuse_count, 2)
                 self.assertEqual(teacher._teacher_handle_prefetch.reuse_count, 2)
-                normal_score = teacher._compute_rm_score
+                normal_entropy = teacher._compute_entropy_safe
+
                 def fail_postprocess(*args, **kwargs):
                     raise RuntimeError("injected Math postprocess failure")
-                teacher._compute_rm_score = fail_postprocess
+
+                teacher._compute_entropy_safe = fail_postprocess
                 with self.assertRaisesRegex(RuntimeError, "injected Math"):
-                    worker.compute_log_prob_and_teacher(batch())
+                    score()
                 self.assertIsNone(code._teacher_handle_prefetch.pending)
-                teacher._compute_rm_score = normal_score
-                # A discarded copy must not poison counters on the next scoring call.
-                recovered = worker.compute_log_prob_and_teacher(batch())
-                code_data = DataProto.from_dict(dict(batch().batch.items()), meta_info=dict(recovered.meta_info))
-                code_data.meta_info.update(reward_mode="mt_opd", log_prob_top_k=4)
-                code_actual = code._compute_rm_score(code_data.union(recovered))
+                teacher._compute_entropy_safe = normal_entropy
+                recovered = score()
+                code_actual = code._compute_rm_score(batch().union(recovered))
                 for key in code_expected.keys():
-                    torch.testing.assert_close(code_actual.batch[key].cpu(), code_expected[key], rtol=0, atol=0)
+                    torch.testing.assert_close(code_actual.batch[key].cpu(), code_expected[key], rtol=0, atol=0, msg=key)
                 self.assertEqual(code._teacher_handle_prefetch.copy_count, 4)
                 self.assertEqual(code._teacher_handle_prefetch.reuse_count, 3)
                 self.assertIsNotNone(code._teacher_handle_prefetch.last_use_done)
-                self.assertFalse(teacher_model.get_output_embeddings()._forward_pre_hooks)
-                worker.config.rollout.log_prob_micro_batch_size_per_gpu = 1
-                with self.assertRaisesRegex(ValueError, "student micro-batch"):
-                    worker.compute_log_prob_and_teacher(batch())
-                worker.config.rollout.log_prob_micro_batch_size_per_gpu = 2
+                # More than one Math micro-batch must still stage Code just once.
                 teacher.config.micro_batch_size_per_gpu = 1
-                with self.assertRaisesRegex(ValueError, "teacher micro-batch"):
-                    worker.compute_log_prob_and_teacher(batch())
+                actual = score()
+                code._compute_rm_score(batch().union(actual))
+                self.assertEqual(code._teacher_handle_prefetch.copy_count, 5)
+                self.assertEqual(code._teacher_handle_prefetch.reuse_count, 5 - 1)
             finally:
-                if teacher is not None and teacher._teacher_forward_overlap is not None:
-                    teacher._teacher_forward_overlap.close()
                 dist.destroy_process_group()
-
-    def test_split_scoring_matches_serial_with_fsdp_prefetch(self):
-        from verl.workers.fsdp_workers import RewardModelWorker
-
-        with tempfile.TemporaryDirectory() as directory:
-            dist.init_process_group("nccl", init_method=Path(directory, "init").as_uri(), rank=0, world_size=1)
-            runner = TeacherForwardOverlap(torch.device("cuda", torch.cuda.current_device()), "test")
-            try:
-                torch.manual_seed(17)
-                raw = TinyLM().to(dtype=torch.bfloat16).eval()
-                model = FSDP(raw, cpu_offload=CPUOffload(offload_params=True), device_id=torch.cuda.current_device())
-                worker = SimpleNamespace(reward_module=model, use_remove_padding=False, use_fused_kernels=False)
-                for name in (
-                    "_forward_model_logits", "_forward_micro_batch", "_compute_entropy_safe",
-                    "_compute_teacher_top_k_log_probs",
-                ):
-                    setattr(worker, name, MethodType(getattr(RewardModelWorker, name), worker))
-                mb = {
-                    "input_ids": torch.randint(0, 64, (1, 8), device="cuda"),
-                    "attention_mask": torch.ones(1, 8, dtype=torch.long, device="cuda"),
-                    "position_ids": torch.arange(8, device="cuda").unsqueeze(0),
-                    "responses": torch.randint(0, 64, (1, 5), device="cuda"),
-                }
-                ids = torch.arange(4, device="cuda").expand(1, 5, 4).clone()
-                # Lazy-init FSDP and establish a serial reference before wrapping pre_unshard.
-                worker._forward_micro_batch(mb, student_top_k_ids=ids, compute_entropy=True, top_k=4)
-                prefetch = TeacherHandlePrefetch(model, max_mb=1)
-                staged_ptr = prefetch.staged.data_ptr()
-                for i, strategy in enumerate(("only_stu", "union", "intersection", "top_p_intersec")):
-                    with self.subTest(strategy=strategy):
-                        kwargs = dict(student_top_k_ids=ids, compute_entropy=True, top_k=4,
-                                      strategy=strategy, teacher_temperature=0.7 if i % 2 else 1.3)
-                        expected = worker._forward_micro_batch(mb, **kwargs)
-                        if runner.last_done is not None:
-                            prefetch.stream.wait_event(runner.last_done)
-                        prefetch.start()
-                        ready = torch.cuda.Event()
-                        ready.record()
-                        calls = raw.calls
-                        entered = threading.Event()
-
-                        def forward():
-                            self.assertEqual(torch.cuda.current_stream(), runner.stream)
-                            entered.set()
-                            return worker._forward_model_logits(mb)
-
-                        runner.start(forward, ready)
-                        self.assertTrue(entered.wait(timeout=10))
-                        # Student-side IDs are produced independently of the teacher model.
-                        live_ids = ids.clone()
-                        logits = runner.finish()
-                        prefetch.assert_consumed(previous_reuse_count=i)
-                        kwargs["student_top_k_ids"] = live_ids
-                        actual = worker._forward_micro_batch(mb, precomputed_logits=logits, **kwargs)
-                        self.assertEqual(raw.calls, calls + 1, "postprocess must not run the teacher model again")
-                        self.assertEqual(prefetch.staged.data_ptr(), staged_ptr)
-                        for reference, result in zip(expected, actual):
-                            if reference is None:
-                                self.assertIsNone(result)
-                            else:
-                                torch.testing.assert_close(result, reference, rtol=0, atol=0)
-                self.assertEqual(prefetch.copy_count, 4)
-                self.assertEqual(prefetch.reuse_count, 4)
-            finally:
-                runner.close()
-                dist.destroy_process_group()
-
-    def test_single_slot_and_exception_cleanup(self):
-        runner = TeacherForwardOverlap(torch.device("cuda", torch.cuda.current_device()), "test")
-        release = threading.Event()
-        ready = torch.cuda.Event()
-        ready.record()
-        try:
-            def forward():
-                if not release.wait(timeout=10):
-                    raise TimeoutError("test release was not signaled")
-                return torch.ones(4, device="cuda")
-
-            runner.start(forward, ready)
-            with self.assertRaisesRegex(RuntimeError, "not been collected"):
-                runner.start(forward, ready)
-            release.set()
-            torch.testing.assert_close(runner.finish(), torch.ones(4, device="cuda"))
-
-            def fail():
-                raise ValueError("teacher failure")
-
-            runner.start(fail, ready)
-            with self.assertRaisesRegex(ValueError, "teacher failure"):
-                runner.finish()
-            self.assertIsNone(runner.future)
-            runner.start(lambda: torch.full((4,), 2.0, device="cuda"), ready)
-            torch.testing.assert_close(runner.finish(), torch.full((4,), 2.0, device="cuda"))
-        finally:
-            release.set()
-            runner.close()
