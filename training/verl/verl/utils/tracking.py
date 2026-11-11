@@ -240,7 +240,19 @@ class FileLogger:
 
     def log(self, data, step):
         data = {"step": step, "data": data}
-        self.fp.write(json.dumps(data) + "\n")
+        self.fp.write(json.dumps(data, default=self._json_value) + "\n")
+        self.fp.flush()
+
+    @staticmethod
+    def _json_value(value):
+        import numpy as np
+        import torch
+
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu().tolist()
+        if isinstance(value, (np.ndarray, np.generic)):
+            return value.tolist()
+        raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
     def finish(self):
         self.fp.close()

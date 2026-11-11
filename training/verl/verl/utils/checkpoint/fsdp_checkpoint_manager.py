@@ -141,11 +141,16 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                 log_with_rank(f"Loaded model from {checkpoint_model_path}", rank=self.rank, logger=logger)
 
             if self.should_load_optimizer:
+                shared_optimizer = getattr(self.optimizer, "_persistent_shared_cpu_state", False)
+                optimizer_rank = self.optimizer.owner_rank if shared_optimizer else self.rank
                 checkpoint_optim_path = os.path.join(
-                    local_path, f"optim_world_size_{self.world_size}_rank_{self.rank}.pt"
+                    local_path, f"optim_world_size_{self.world_size}_rank_{optimizer_rank}.pt"
                 )
                 local_optim_path = copy_to_local(checkpoint_optim_path)
-                optimizer_state_dict = torch.load(local_optim_path, weights_only=False)
+                optimizer_state_dict = torch.load(
+                    local_optim_path, weights_only=False,
+                    **({"mmap": True, "map_location": "cpu"} if shared_optimizer else {}),
+                )
                 self.optimizer.load_state_dict(optimizer_state_dict)
                 log_with_rank(f"Loaded optimizer from {checkpoint_optim_path}", rank=self.rank, logger=logger)
 
@@ -231,7 +236,10 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                     torch.save(model_state_dict, model_path)
                     log_with_rank(f"Saved model to {os.path.abspath(model_path)}", rank=self.rank, logger=logger)
 
-                if self.should_save_optimizer:
+                if self.should_save_optimizer and (
+                    not getattr(self.optimizer, "_persistent_shared_cpu_state", False)
+                    or self.rank == self.optimizer.owner_rank
+                ):
                     optimizer_state_dict = self.optimizer.state_dict()
                     torch.save(optimizer_state_dict, optim_path)
                     log_with_rank(f"Saved optim to {os.path.abspath(optim_path)}", rank=self.rank, logger=logger)

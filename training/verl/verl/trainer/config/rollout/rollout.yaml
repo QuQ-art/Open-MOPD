@@ -353,7 +353,7 @@ skip_dump_dir: /tmp/rollout_dump
 # When enabled (True), the rollout assume token in token out for generation
 skip_tokenizer_init: True
 
-# profile the rollout model in `generate_sequence` 
+# profile the rollout model in `generate_sequence`
 profiler:
 
   # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
@@ -377,3 +377,25 @@ profiler:
 
   # specific tool config
   tool_config: ${oc.select:actor_rollout_ref.actor.profiler.tool_config,null}
+
+multi_gpu:
+
+  # Whether to enable multi-GPU rollout. When enabled, the rollout will be distributed across multiple GPUs.
+  enable: false
+
+  # Currently only replicated_dp is implemented; other modes fail preflight.
+  mode: replicated_dp
+
+  gradient_sync: auto_all_reduce
+
+  # shared: one optimizer owner; separate: state per rank. No interprocess pointer aliasing.
+  cpu_state_mode: shared
+
+  # The rank of the GPU that will own the optimizer.
+  optimizer_owner_rank: 0
+
+  # Whether to perform synchronous updates across GPUs. When enabled, all GPUs will synchronize their updates before proceeding to the next step.
+  synchronous_update: true
+
+  # Whether to verify the policy version during rollout. When enabled, the rollout will check that the policy version matches the expected student version before proceeding.
+  verify_policy_version: true

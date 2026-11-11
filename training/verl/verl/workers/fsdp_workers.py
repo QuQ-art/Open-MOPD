@@ -20,7 +20,7 @@ import json
 import logging
 import os
 import warnings
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict
 from typing import Any, Optional
 
@@ -208,7 +208,7 @@ def _mopd_release_init_host_cache(label):
         f"HOST_CACHE {label}: pinned_reserved_GiB="
         f"{before['allocated_bytes.current'] / 2**30:.2f}->"
         f"{after['allocated_bytes.current'] / 2**30:.2f}, "
-        f"pinned_active_GiB={after['active_bytes.current'] / 2**30:.2f}, "
+        f"pinned_active_GiB={after.get('active_bytes.current', float('nan')) / 2**30:.2f}, "
         f"pinned_registered_GiB={registered['allocated_bytes'] / 2**30:.2f}, "
         f"pinned_total_GiB={(after['allocated_bytes.current'] + registered['allocated_bytes']) / 2**30:.2f}, "
         f"rss_GiB={psutil.Process().memory_info().rss / 2**30:.2f}",
@@ -226,7 +226,9 @@ def _mopd_prepare_inference_teacher(model, label):
         raise ValueError("Inference teacher memory cleanup requires FSDP1")
     model.eval()
     model.requires_grad_(False)
-    aligned = bool(pinned_alignment_bytes())
+    shared = any(hasattr(m._handle.flat_param, "_openmopd_shared_cpu")
+                 for m in FSDP.fsdp_modules(model) if m._handle is not None)
+    aligned = bool(pinned_alignment_bytes()) and not shared
     # Pin before lazy init: .pin_memory() is a no-op on an already pinned
     # tensor. This avoids the old power-of-two parameter allocation entirely.
     # Models initialized earlier are migrated below instead.
@@ -252,7 +254,7 @@ def _mopd_prepare_inference_teacher(model, label):
         flat = handle.flat_param
         if handle.uses_sharded_strategy or not handle._offload_params or handle._use_orig_params:
             raise ValueError("Inference teacher cleanup requires CPU-offloaded NO_SHARD with orig_params=false")
-        if flat.requires_grad or flat.device.type != "cpu" or not flat._local_shard.is_pinned():
+        if flat.requires_grad or flat.device.type != "cpu" or (not shared and not flat._local_shard.is_pinned()):
             raise ValueError("Inference teacher must be frozen with pinned CPU parameters")
         if aligned and not pre_pinned:
             host = empty_pinned_like(flat._local_shard)
@@ -299,9 +301,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # build device mesh for FSDP
         world_size = torch.distributed.get_world_size()
+        self._multi_gpu = self.config.rollout.get("multi_gpu", {}).get("enable", False)
         memory_limit_gb = self.config.rollout.get("gpu_memory_limit_gb")
         if memory_limit_gb is not None:
-            if world_size != 1 or device_name != "cuda":
+            if (world_size != 1 and not self._multi_gpu) or device_name != "cuda":
                 raise ValueError("gpu_memory_limit_gb currently requires a single CUDA GPU")
             from verl.utils.memory_utils import set_gpu_memory_limit
 
@@ -449,7 +452,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         """Apply and validate the deliberately narrow zero-copy configuration."""
         if not self._is_actor or not self._is_rollout:
             raise ValueError("rollout.share_weights requires a colocated actor_rollout worker")
-        if world_size != 1:
+        if self._multi_gpu:
+            from verl.workers.config.multi_gpu import validate_replicated_weight_sharing
+
+            validate_replicated_weight_sharing(self.config.rollout.multi_gpu, world_size)
+        elif world_size != 1:
             raise ValueError(f"rollout.share_weights only supports world_size=1, got {world_size}")
         if self.config.rollout.name != "vllm" or self.config.rollout.mode != "sync":
             raise ValueError("rollout.share_weights requires rollout.name=vllm and rollout.mode=sync")
@@ -494,7 +501,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.config.rollout.load_format = "dummy"
 
         logger.warning(
-            "Enabling single-GPU shared actor/vLLM weights: dtype=bfloat16, "
+            "Enabling rank-local shared actor/vLLM weights: dtype=bfloat16, "
             "optimizer=BF16StochasticAdamW, use_orig_params=True, enforce_eager=%s",
             self.config.rollout.enforce_eager,
         )
@@ -579,6 +586,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             use_meta_tensor=not actor_model_config.tie_word_embeddings, mesh=self.device_mesh
         )
 
+        shared_initial = None
+        if role == "actor" and self._multi_gpu and self.config.rollout.multi_gpu.get("cpu_state_mode", "shared") == "shared":
+            from verl.workers.multi_gpu.teacher_store import SharedTeacherStore
+            shared_initial = SharedTeacherStore("student")
+            init_context = nullcontext
+
         with init_context(), warnings.catch_warnings():
             warnings.simplefilter("ignore")
             has_remote_code = hasattr(actor_model_config, "auto_map") and any(
@@ -607,13 +620,20 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 else:
                     actor_module_class = AutoModel
 
-            actor_module = actor_module_class.from_pretrained(
-                pretrained_model_name_or_path=local_path,
-                torch_dtype=torch_dtype,
-                config=actor_model_config,
-                trust_remote_code=trust_remote_code,
-                attn_implementation=attn_implementation,
-            )
+            def load_student():
+                return actor_module_class.from_pretrained(
+                    pretrained_model_name_or_path=local_path, torch_dtype=torch_dtype,
+                    config=actor_model_config, trust_remote_code=trust_remote_code,
+                    attn_implementation=attn_implementation,
+                )
+
+            if shared_initial is not None:
+                actor_module = shared_initial.load_model(load_student, lambda: actor_module_class.from_config(
+                    actor_model_config, torch_dtype=torch_dtype, trust_remote_code=trust_remote_code,
+                    attn_implementation=attn_implementation,
+                ))
+            else:
+                actor_module = load_student()
 
             # Apply Liger kernel to the model if use_liger is set to True
             if use_liger:
@@ -726,6 +746,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         fsdp_mesh = self.device_mesh
         sharding_strategy = get_sharding_strategy(fsdp_mesh)
+        if role == "actor" and self._multi_gpu:
+            from verl.workers.multi_gpu import MultiGPUGradientSync
+
+            sharding_strategy = MultiGPUGradientSync.sharding_strategy()
 
         # TODO: add transformer policy
         # We force reference policy to use CPUOffload to save memory.
@@ -772,6 +796,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         else:
             raise NotImplementedError(f"not implement {fsdp_strategy}")
 
+        if shared_initial is not None:
+            # FSDP has consumed the shared checkpoint staging views into GPU storage.
+            shared_initial.finish_initialization()
+
         if enable_activation_offload:
             enable_activation_offloading(actor_module_fsdp, fsdp_strategy, enable_gradient_checkpointing)
 
@@ -782,7 +810,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
 
             actor_optimizer = build_optimizer(actor_module_fsdp.parameters(), optim_config)
-            if self._uses_cpu_adam():
+            if self._multi_gpu:
+                from verl.workers.multi_gpu import build_multi_gpu_optimizer
+
+                actor_optimizer = build_multi_gpu_optimizer(actor_optimizer, self.config.rollout.multi_gpu)
+            elif self._uses_cpu_adam():
                 from verl.utils.cpu_adam_pipeline import CPUAdamPipeline
 
                 if not self._share_rollout_weights or self.config.actor.ppo_epochs != 1:
@@ -843,6 +875,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def _build_rollout(self, trust_remote_code=False):
         from torch.distributed.device_mesh import init_device_mesh
 
+        if self._multi_gpu:
+            # Release initialization temporaries before vLLM checks free device memory.
+            aggressive_empty_cache(force_sync=True)
+
         # 1. parse rollout and huggingface model config
         rollout_config: RolloutConfig = omega_conf_to_dataclass(self.config.rollout)
         model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model, dataclass_type=HFModelConfig)
@@ -895,7 +931,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         log_gpu_memory_usage(f"After building {self.config.rollout.name} rollout", logger=logger)
 
         # Full params
-        if torch.distributed.get_world_size() == 1 and fsdp_version(self.actor_module_fsdp) == 1:
+        if (torch.distributed.get_world_size() == 1 or self._multi_gpu) and fsdp_version(self.actor_module_fsdp) == 1:
             FSDP.set_state_dict_type(
                 self.actor_module_fsdp,
                 state_dict_type=StateDictType.FULL_STATE_DICT,
@@ -1131,7 +1167,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     self.config.actor.opd_refresh_advantage = True
             actor_cfg = omega_conf_to_dataclass(self.config.actor)
             self.actor = DataParallelPPOActor(
-                config=actor_cfg, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer
+                config=actor_cfg, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer,
+                global_token_mean=self._multi_gpu,
             )
             if self._synchronous_cpu_adam():
                 self.actor._opd_reward_weight_mode = self.config.rollout.get("reward_weight_mode", "student_p")
@@ -1306,6 +1343,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             # perform training
             with Timer(name="update_policy", logger=None) as timer:
                 metrics = self.actor.update_policy(data=data)
+            if self._multi_gpu and getattr(self.actor_optimizer, "_persistent_shared_cpu_state", False):
+                steps = [state["step"].item() for state in self.actor_optimizer.state.values()]
+                metrics["multi_gpu/optimizer_step_min"] = min(steps)
+                metrics["multi_gpu/optimizer_step_max"] = max(steps)
+                metrics["multi_gpu/published_version"] = self.actor_optimizer.publisher.version
             if self._uses_cpu_adam():
                 metrics.update(self.actor_optimizer.last_metrics)
                 metrics["pipeline/policy_lag"] = (
@@ -1333,6 +1375,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
             metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
             metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
+            if self._multi_gpu:
+                metrics["perf/current_memory_allocated_gb"] = get_torch_device().memory_allocated() / (1024**3)
+                metrics["perf/current_memory_reserved_gb"] = get_torch_device().memory_reserved() / (1024**3)
+                get_torch_device().reset_peak_memory_stats()
 
             lr = self.actor_lr_scheduler.get_last_lr()[0]
             metrics["actor/lr"] = lr.item() if torch.is_tensor(lr) else lr
@@ -1390,6 +1436,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             loop = get_event_loop()
             loop.run_until_complete(self.rollout_mode())
             log_gpu_memory_usage("After switch to rollout mode", logger=logger)
+            if self._multi_gpu:
+                # rollout_mode has completed the actor -> vLLM copy on every rank.
+                publisher = self.actor_optimizer.publisher
+                publisher.assert_version(self.actor_module_fsdp.parameters())
+                rollout_version = publisher.version
 
         with simple_timer("generate_sequences", timing_generate):
             with _openmopd_nvtx("compute::student_rollout"):
@@ -1496,7 +1547,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
         # unshard the root FSDP module
-        if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
+        if self.world_size > 1 and not self._multi_gpu and fsdp_version(self.actor.actor_module) == 1:
             self.actor.actor_module._handle.reshard(True)
 
         if self._is_offload_param:
@@ -1644,7 +1695,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
         # unshard the root FSDP module
-        if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
+        if self.world_size > 1 and not self._multi_gpu and fsdp_version(self.actor.actor_module) == 1:
             self.actor.actor_module._handle.reshard(True)
 
         if self._is_offload_param:
@@ -1675,7 +1726,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
         # unshard the root FSDP module
-        if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
+        if self.world_size > 1 and not self._multi_gpu and fsdp_version(self.actor.actor_module) == 1:
             self.actor.actor_module._handle.reshard(True)
 
         if self._is_offload_param:
@@ -1694,7 +1745,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         with self.ulysses_sharding_manager:
             output = self.actor.compute_delta_opd_reward(data=data)
 
-        if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
+        if self.world_size > 1 and not self._multi_gpu and fsdp_version(self.actor.actor_module) == 1:
             self.actor.actor_module._handle.reshard(True)
 
         if self._is_offload_param:
@@ -1713,7 +1764,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         with self.ulysses_sharding_manager:
             output = self.actor.compute_exopd_reward(data=data)
 
-        if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
+        if self.world_size > 1 and not self._multi_gpu and fsdp_version(self.actor.actor_module) == 1:
             self.actor.actor_module._handle.reshard(True)
 
         if self._is_offload_param:
@@ -2463,17 +2514,35 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         model_dtype_str = config.model.get("dtype", "bf16")
         model_dtype = PrecisionType.to_dtype(model_dtype_str)
 
+        self._shared_teacher_store = None
+        if os.environ.get("OPENMOPD_CPU_STATE_NAMESPACE") and self.world_size > 1:
+            if config.strategy != "fsdp" or not config.model.fsdp_config.get("param_offload", True):
+                raise ValueError("shared teacher CPU state requires FSDP1 with param_offload=true")
+            from verl.workers.multi_gpu.teacher_store import SharedTeacherStore
+            import hashlib
+            self._shared_teacher_store = SharedTeacherStore("teacher/" + hashlib.sha256(
+                str(config.model.path).encode()).hexdigest())
+            init_context = nullcontext
+
         with init_context(), warnings.catch_warnings():
             warnings.simplefilter("ignore")
             model_config.classifier_dropout = 0.0
             model_config.hidden_dropout = "0"
-            reward_module = AutoModelForCausalLM.from_pretrained(
-                pretrained_model_name_or_path=local_path,
-                config=model_config,
-                torch_dtype=model_dtype,
-                attn_implementation="flash_attention_2",
-                trust_remote_code=trust_remote_code,
-            )
+            def load_teacher():
+                return AutoModelForCausalLM.from_pretrained(
+                    pretrained_model_name_or_path=local_path, config=model_config,
+                    torch_dtype=model_dtype, attn_implementation="flash_attention_2",
+                    trust_remote_code=trust_remote_code,
+                )
+
+            if self._shared_teacher_store is not None:
+                reward_module = self._shared_teacher_store.load_model(
+                    load_teacher, lambda: AutoModelForCausalLM.from_config(
+                        model_config, torch_dtype=model_dtype, attn_implementation="flash_attention_2",
+                        trust_remote_code=trust_remote_code,
+                    ))
+            else:
+                reward_module = load_teacher()
 
             apply_monkey_patch(
                 model=reward_module,
@@ -2488,6 +2557,10 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         fsdp_mesh = self.device_mesh
         sharding_strategy = get_sharding_strategy(fsdp_mesh)
 
+        if self._shared_teacher_store is not None:
+            from verl.workers.multi_gpu import MultiGPUGradientSync
+            sharding_strategy = MultiGPUGradientSync.sharding_strategy()
+
         if config.strategy == "fsdp":
             reward_module = FSDP(
                 reward_module,
@@ -2497,10 +2570,16 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                 device_id=get_device_id(),
                 sharding_strategy=sharding_strategy,  # zero3
                 sync_module_states=True,
-                cpu_offload=CPUOffload(offload_params=bool(config.model.fsdp_config.get("param_offload", True))),
+                cpu_offload=CPUOffload(offload_params=(
+                    self._shared_teacher_store is None
+                    and bool(config.model.fsdp_config.get("param_offload", True))
+                )),
                 forward_prefetch=self.config.model.fsdp_config.forward_prefetch,
                 device_mesh=self.device_mesh,
             )
+            if self._shared_teacher_store is not None:
+                reward_module.requires_grad_(False)
+                self._shared_teacher_store.bind_fsdp(reward_module)
             # CPU offload moves flat parameters but leaves module views on the
             # old GPU storage with use_orig_params=False. Release those before
             # loading another teacher or vLLM, including before validation.
@@ -3377,6 +3456,12 @@ class RewardModelWorker(Worker, DistProfilerExtension):
 
         from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
 
+        shared_store = getattr(self, "_shared_teacher_store", None)
+        if shared_store is not None:
+            if precomputed_logits is not None or getattr(self, "_teacher_layer_pipeline", None) is not None:
+                raise ValueError("shared multi-GPU teachers require sequential scoring from shared CPU weights")
+            shared_store.assert_shared_sources(self.reward_module)
+
         token_batch = data.meta_info.get("pipeline_token_batch", False)
         if token_batch and getattr(self, "_teacher_layer_pipeline", None) is None:
             raise ValueError("token batching requires a shared teacher pipeline")
@@ -3599,11 +3684,14 @@ class RewardModelWorker(Worker, DistProfilerExtension):
 
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
         # unshard the root FSDP module
-        if self.world_size > 1 and fsdp_version(self.reward_module) == 1:
+        if self.world_size > 1 and self._shared_teacher_store is None and fsdp_version(self.reward_module) == 1:
             self.reward_module._handle.reshard(True)
 
         if prefetch is not None and prefetch.copy_count > previous_reuse_count:
             prefetch.assert_consumed(previous_reuse_count)
+
+        if shared_store is not None:
+            shared_store.assert_shared_sources(self.reward_module)
 
         # Keep on GPU to avoid expensive CPU-GPU transfer for large top-k data
         # output = output.to("cpu")

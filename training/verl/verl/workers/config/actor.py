@@ -235,6 +235,7 @@ class FSDPActorConfig(ActorConfig):
     grad_clip: float = 1.0
     ulysses_sequence_parallel_size: int = 1
     entropy_from_logits_with_chunking: bool = False
+    entropy_chunk_size: int = 2048
     entropy_checkpointing: bool = False
     fsdp_config: FSDPEngineConfig = field(default_factory=FSDPEngineConfig)
     use_remove_padding: bool = False

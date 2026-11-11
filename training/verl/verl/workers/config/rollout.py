@@ -188,6 +188,8 @@ class RolloutConfig(BaseConfig):
     # optimizer updates are visible without actor -> rollout weight copies.
     share_weights: bool = False
 
+    multi_gpu: dict = field(default_factory=dict)
+
     # Stage one teacher FSDP1 CPU shard during student log-prob computation.
     teacher_param_prefetch: bool = False
 

@@ -56,6 +56,12 @@ def run_ppo(config, task_runner_class=None) -> None:
                 model paths, and training hyperparameters.
         task_runner_class: For recipe to change TaskRunner.
     """
+    from verl.workers.config.multi_gpu import validate_training_config
+
+    validate_training_config(config)
+    cpu_state_owner = None
+    shared_env = {}
+    multi_gpu = config.actor_rollout_ref.rollout.get("multi_gpu", {})
     # Check if Ray is not initialized
     if not ray.is_initialized():
         # Initialize Ray with a local cluster configuration
@@ -80,24 +86,33 @@ def run_ppo(config, task_runner_class=None) -> None:
     if task_runner_class is None:
         task_runner_class = ray.remote(num_cpus=1)(TaskRunner)  # please make sure main_task is not scheduled on head
 
+    if multi_gpu.get("enable", False) and multi_gpu.get("cpu_state_mode", "shared") == "shared":
+        from verl.workers.multi_gpu.cpu_state_store import CPUStateStore, ENV_NAME
+        cpu_state_owner = CPUStateStore.create()
+        shared_env[ENV_NAME] = cpu_state_owner.namespace
+
     # Create a remote instance of the TaskRunner class, and
     # Execute the `run` method of the TaskRunner instance remotely and wait for it to complete
-    if (
-        is_cuda_available
-        and config.global_profiler.tool == "nsys"
-        and config.global_profiler.get("steps") is not None
-        and len(config.global_profiler.get("steps", [])) > 0
-    ):
-        from verl.utils.import_utils import is_nvtx_available
+    try:
+        if (
+            is_cuda_available
+            and config.global_profiler.tool == "nsys"
+            and config.global_profiler.get("steps") is not None
+            and len(config.global_profiler.get("steps", [])) > 0
+        ):
+            from verl.utils.import_utils import is_nvtx_available
 
-        assert is_nvtx_available(), "nvtx is not available in CUDA platform. Please 'pip3 install nvtx'"
-        nsight_options = OmegaConf.to_container(
-            config.global_profiler.global_tool_config.nsys.controller_nsight_options
-        )
-        runner = task_runner_class.options(runtime_env={"nsight": nsight_options}).remote()
-    else:
-        runner = task_runner_class.remote()
-    ray.get(runner.run.remote(config))
+            assert is_nvtx_available(), "nvtx is not available in CUDA platform. Please 'pip3 install nvtx'"
+            nsight_options = OmegaConf.to_container(
+                config.global_profiler.global_tool_config.nsys.controller_nsight_options
+            )
+            runner = task_runner_class.options(runtime_env={"nsight": nsight_options, "env_vars": shared_env}).remote()
+        else:
+            runner = task_runner_class.options(runtime_env={"env_vars": shared_env}).remote()
+        ray.get(runner.run.remote(config))
+    finally:
+        if cpu_state_owner is not None:
+            cpu_state_owner.unlink()
 
     # [Optional] get the path of the timeline trace file from the configuration, default to None
     # This file is used for performance analysis

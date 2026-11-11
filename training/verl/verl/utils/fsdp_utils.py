@@ -248,6 +248,8 @@ def load_fsdp2_model_to_gpu(model):
 
 @torch.no_grad()
 def offload_fsdp_optimizer(optimizer):
+    if getattr(optimizer, "_persistent_shared_cpu_state", False):
+        return
     from verl.utils.cpu_adam_pipeline import CPUAdamPipeline
     if isinstance(optimizer, CPUAdamPipeline):
         return  # CPU states are persistent; do not wait for the pending update.
@@ -266,6 +268,8 @@ def offload_fsdp_optimizer(optimizer):
 
 @torch.no_grad()
 def load_fsdp_optimizer(optimizer, device_id):
+    if getattr(optimizer, "_persistent_shared_cpu_state", False):
+        return
     from verl.utils.cpu_adam_pipeline import CPUAdamPipeline
     if isinstance(optimizer, CPUAdamPipeline):
         return

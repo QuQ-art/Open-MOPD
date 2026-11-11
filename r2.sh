@@ -17,6 +17,8 @@ while (($# > 0)); do
             printf 'Trailing Hydra overrides take precedence; TOKEN_BATCHING_ENABLED=false restores ordinary batching.\n'
             printf 'USE_CU13=false; true prefers the CUDA 13 toolkit bundled with the selected Python environment.\n'
             printf 'Environment: PYTHONNOUSERSITE=1; VLLM_USE_V2_MODEL_RUNNER defaults to 0.\n'
+            printf 'Multi-GPU disables single-GPU overlap, shared actor/vLLM weights, CPUAdam slots, and token batching by default.\n'
+            printf 'Multi-GPU: OPENMOPD_N_GPUS_PER_NODE=2 auto-enables replicated_dp; MULTI_GPU_CPU_STATE_MODE=shared|separate, MULTI_GPU_OPTIMIZER_OWNER_RANK=0.\n'
             printf 'CPUAdam: CPU_ADAM_ENABLED=false, CPU_ADAM_ASYNC=null (true/false/null).\n'
             printf 'Gradients/backend: PIPELINE_FP32_GRADIENTS=false, PIPELINE_OPTIMIZER_BACKEND=cpu (cpu/cuda).\n'
             printf 'TEACHER_PARAM_OFFLOAD=true applies to all three teachers; use Hydra overrides per teacher.\n'
@@ -59,8 +61,29 @@ hydra_string() {
   printf '"%s"' "${value}"
 }
 
+# Inspect topology overrides before selecting defaults; final validation still
+# runs after every trailing override has been appended.
+num_gpus="${OPENMOPD_N_GPUS_PER_NODE:-1}"
+MULTI_GPU_ENABLED="${MULTI_GPU_ENABLED:-auto}"
+for override in "$@"; do
+    case "${override}" in
+        trainer.n_gpus_per_node=*) num_gpus="${override#*=}" ;;
+        actor_rollout_ref.rollout.multi_gpu.enable=*|+actor_rollout_ref.rollout.multi_gpu.enable=*|++actor_rollout_ref.rollout.multi_gpu.enable=*) MULTI_GPU_ENABLED="${override#*=}" ;;
+    esac
+done
+[[ "${num_gpus}" =~ ^[1-9][0-9]*$ ]] || die "OPENMOPD_N_GPUS_PER_NODE must be a positive integer"
+if [[ "${MULTI_GPU_ENABLED}" == auto ]]; then
+    MULTI_GPU_ENABLED=false
+    if ((num_gpus > 1)); then MULTI_GPU_ENABLED=true; fi
+fi
+[[ "${MULTI_GPU_ENABLED}" == true || "${MULTI_GPU_ENABLED}" == false ]] || die "MULTI_GPU_ENABLED must be auto, true, or false"
+single_gpu_default=true
+if [[ "${MULTI_GPU_ENABLED}" == true ]]; then single_gpu_default=false; fi
+MULTI_GPU_MODE="${MULTI_GPU_MODE:-replicated_dp}"
+MULTI_GPU_CPU_STATE_MODE="${MULTI_GPU_CPU_STATE_MODE:-shared}"
+MULTI_GPU_OPTIMIZER_OWNER_RANK="${MULTI_GPU_OPTIMIZER_OWNER_RANK:-0}"
 USE_CU13="${USE_CU13:-false}"
-SHARE_STUDENT_WEIGHTS="${SHARE_STUDENT_WEIGHTS:-true}"
+SHARE_STUDENT_WEIGHTS="${SHARE_STUDENT_WEIGHTS:-${single_gpu_default}}"
 # Weight-copy diagnostics apply to the non-shared rollout path.
 VERIFY_WEIGHT_SYNC="${VERIFY_WEIGHT_SYNC:-false}"
 SKIP_INITIAL_WEIGHT_SYNC="${SKIP_INITIAL_WEIGHT_SYNC:-false}"
@@ -73,36 +96,35 @@ TOP_K_STRATEGY="${TOP_K_STRATEGY:-only_stu}"
 REWARD_WEIGHT_MODE="${REWARD_WEIGHT_MODE:-student_p}"
 TEACHER_TEMPERATURE="${TEACHER_TEMPERATURE:-1.0}"
 BF16_STUDENT_WEIGHTS="${BF16_STUDENT_WEIGHTS:-true}"
-STUDENT_TEACHER_PIPELINE="${STUDENT_TEACHER_PIPELINE:-true}"
+STUDENT_TEACHER_PIPELINE="${STUDENT_TEACHER_PIPELINE:-${single_gpu_default}}"
 # Match the Hydra defaults; slot reuse also enables CPUAdam.
 CPU_ADAM_ENABLED="${CPU_ADAM_ENABLED:-false}"
 # null preserves legacy publication timing; false publishes in step().
 CPU_ADAM_ASYNC="${CPU_ADAM_ASYNC:-null}"
 PIPELINE_FP32_GRADIENTS="${PIPELINE_FP32_GRADIENTS:-false}"
 PIPELINE_OPTIMIZER_BACKEND="${PIPELINE_OPTIMIZER_BACKEND:-cpu}"
-PIPELINE_OVERLAP="${PIPELINE_OVERLAP:-true}"
+PIPELINE_OVERLAP="${PIPELINE_OVERLAP:-${single_gpu_default}}"
 CPU_OPTIMIZER_THREADS="${CPU_OPTIMIZER_THREADS:-8}"
 PIPELINE_GRADIENT_OFFLOAD="${PIPELINE_GRADIENT_OFFLOAD:-true}"
 STEP_MEMORY_ENABLED="${STEP_MEMORY_ENABLED:-true}"
 TEACHER_LAYER_PIPELINE="${TEACHER_LAYER_PIPELINE:-false}"
 TEACHER_LAYER_PIPELINE_MAX_MB="${TEACHER_LAYER_PIPELINE_MAX_MB:-8192}"
-optimizer_layer_default=true
+optimizer_layer_default="${single_gpu_default}"
 if [[ "${STUDENT_TEACHER_PIPELINE}" == true || "${CPU_ADAM_ENABLED}" == true ]]; then
     optimizer_layer_default=false
 fi
 OPTIMIZER_OFFLOAD_PER_LAYER="${OPTIMIZER_OFFLOAD_PER_LAYER:-${optimizer_layer_default}}"
 # Shared default for the primary and both additional teachers.
 TEACHER_PARAM_OFFLOAD="${TEACHER_PARAM_OFFLOAD:-true}"
-TEACHER_PARAM_PREFETCH="${TEACHER_PARAM_PREFETCH:-true}"
+TEACHER_PARAM_PREFETCH="${TEACHER_PARAM_PREFETCH:-${single_gpu_default}}"
 TEACHER_PARAM_PREFETCH_MAX_MB="${TEACHER_PARAM_PREFETCH_MAX_MB:-768}"
-TEACHER_FORWARD_OVERLAP="${TEACHER_FORWARD_OVERLAP:-true}"
+TEACHER_FORWARD_OVERLAP="${TEACHER_FORWARD_OVERLAP:-${single_gpu_default}}"
 export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-8}"
 export OPENMOPD_PINNED_ALIGNMENT_MB="${OPENMOPD_PINNED_ALIGNMENT_MB:-2}"
 [[ "${OPENMOPD_PINNED_ALIGNMENT_MB}" =~ ^[0-9]+$ ]] || die "OPENMOPD_PINNED_ALIGNMENT_MB must be a nonnegative integer"
-num_gpus="${OPENMOPD_N_GPUS_PER_NODE:-1}"
 train_batch_size="${OPENMOPD_TRAIN_BATCH_SIZE:-${num_gpus}}"
 # Keep rollout chunks fixed; merge actual prompt+response tokens before scoring/training.
-TOKEN_BATCHING_ENABLED="${TOKEN_BATCHING_ENABLED:-true}"
+TOKEN_BATCHING_ENABLED="${TOKEN_BATCHING_ENABLED:-${single_gpu_default}}"
 TOKEN_BATCHING_MIN_TOKENS="${TOKEN_BATCHING_MIN_TOKENS:-8192}"
 TOKEN_BATCHING_MAX_BATCH_SIZE="${TOKEN_BATCHING_MAX_BATCH_SIZE:-64}"
 gpu_memory_limit_gb="${OPENMOPD_GPU_MEMORY_LIMIT_GB:-24}"
@@ -143,23 +165,23 @@ for var in num_gpus train_batch_size TEACHER_LAYER_PIPELINE_MAX_MB \
 done
 ((gpu_memory_limit_gb > 1 && kv_cache_mb < (gpu_memory_limit_gb - 1) * 1024)) || \
   die "GPU budget must exceed 1 GiB plus the KV cache"
-((num_gpus == 1)) || die "The GPU memory budget currently requires one GPU"
+
 cudagraph_sizes_csv=1
 for ((capture_size = 2; capture_size < max_num_seqs; capture_size *= 2)); do
   cudagraph_sizes_csv+=",${capture_size}"
 done
 if ((max_num_seqs > 1)); then cudagraph_sizes_csv+=",${max_num_seqs}"; fi
-((train_batch_size % num_gpus == 0)) || die "Train batch size must be divisible by GPU count"
-if [[ "${TEACHER_FORWARD_OVERLAP}" == true ]] && ((num_gpus != 1 || train_batch_size != 1)); then
-  die "Teacher forward overlap requires one GPU and batch size 1; set TEACHER_FORWARD_OVERLAP=false"
-fi
 
 [[ "${num_steps}" == null || "${num_steps}" =~ ^[1-9][0-9]*$ ]] || \
     die "OPENMOPD_NUM_STEPS must be a positive integer"
 
 python_bin="$(resolve_executable "${python_bin}")"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+if [[ -z "${CUDA_VISIBLE_DEVICES+x}" ]]; then
+    CUDA_VISIBLE_DEVICES=0
+    for ((gpu = 1; gpu < num_gpus; gpu++)); do CUDA_VISIBLE_DEVICES+=",${gpu}"; done
+fi
+export CUDA_VISIBLE_DEVICES
 export VLLM_USE_V1=1 TOKENIZERS_PARALLELISM=false HYDRA_FULL_ERROR=1
 export PYTHONNOUSERSITE=1
 # The shared-weight integration accesses the original v1 model runner.
@@ -191,6 +213,13 @@ cmd=("${python_bin}" -m verl.trainer.main_ppo
   data.val_batch_size="${val_batch_size}"
   data.filter_overlong_prompts=True data.truncation=error
   "actor_rollout_ref.model.path=$(hydra_string "${model_root}/MixSFT")"
+  actor_rollout_ref.rollout.multi_gpu.enable="${MULTI_GPU_ENABLED}"
+  actor_rollout_ref.rollout.multi_gpu.mode="${MULTI_GPU_MODE}"
+  actor_rollout_ref.rollout.multi_gpu.cpu_state_mode="${MULTI_GPU_CPU_STATE_MODE}"
+  actor_rollout_ref.rollout.multi_gpu.optimizer_owner_rank="${MULTI_GPU_OPTIMIZER_OWNER_RANK}"
+  actor_rollout_ref.rollout.multi_gpu.gradient_sync=auto_all_reduce
+  actor_rollout_ref.rollout.multi_gpu.synchronous_update=true
+  actor_rollout_ref.rollout.multi_gpu.verify_policy_version=true
   actor_rollout_ref.rollout.name=vllm
   actor_rollout_ref.rollout.share_weights="${SHARE_STUDENT_WEIGHTS}"
   actor_rollout_ref.rollout.verify_weight_sync="${VERIFY_WEIGHT_SYNC}"
@@ -221,10 +250,12 @@ cmd=("${python_bin}" -m verl.trainer.main_ppo
   actor_rollout_ref.rollout.n=1 actor_rollout_ref.rollout.max_model_len=5120
   actor_rollout_ref.actor.ppo_mini_batch_size="${train_batch_size}"
   actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1
+  actor_rollout_ref.actor.ppo_epochs=1
   actor_rollout_ref.actor.fsdp_config.optimizer_offload=True
   actor_rollout_ref.actor.fsdp_config.optimizer_offload_per_layer="${OPTIMIZER_OFFLOAD_PER_LAYER}"
   actor_rollout_ref.actor.optim.override_optimizer_config='{foreach:false}'
   actor_rollout_ref.rollout.tensor_model_parallel_size=1
+  actor_rollout_ref.rollout.data_parallel_size=1
   actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1
   +actor_rollout_ref.rollout.log_prob_top_k=256
   +actor_rollout_ref.rollout.top_k_strategy="${TOP_K_STRATEGY}"
@@ -267,6 +298,8 @@ if [[ "${BF16_STUDENT_WEIGHTS}" == true && "${SHARE_STUDENT_WEIGHTS}" != true ]]
     actor_rollout_ref.actor.optim.optimizer=BF16StochasticAdamW)
 fi
 cmd+=("$@")
+# Dependency-free validation also applies to dry-run and final Hydra overrides.
+"${python_bin}" "${repo_root}/training/verl/verl/workers/config/multi_gpu.py" "${cmd[@]:3}"
 if [[ "${dry_run}" == true ]]; then
     printf '%q ' "${cmd[@]}"
     printf '\n'

@@ -19,7 +19,7 @@ __pycache__/
 log/
 experiments/runtime_data/
 training/outputs/
-
+tensorboard_log/
 
 temp_files/
 

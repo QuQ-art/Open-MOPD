@@ -207,13 +207,18 @@ class DataParallelPPOActor(BasePPOActor):
         config (ActorConfig): Actor config
         actor_module (nn.Module): Actor or ref module
         actor_optimizer (torch.optim.Optimizer, optional): Actor optimizer. Defaults to None.
+        global_token_mean (bool): Normalize replicated-DP token losses over the global mini-batch.
     """
 
-    def __init__(self, config: ActorConfig, actor_module: nn.Module, actor_optimizer: torch.optim.Optimizer = None):
+    def __init__(
+        self, config: ActorConfig, actor_module: nn.Module, actor_optimizer: torch.optim.Optimizer = None,
+        *, global_token_mean: bool = False,
+    ):
         """When optimizer is None, it is Reference Policy"""
         super().__init__(config)
         self.actor_module = actor_module
         self.actor_optimizer = actor_optimizer
+        self._global_token_mean = global_token_mean
         role = "Ref" if actor_optimizer is None else "Actor"
 
         self.use_remove_padding = self.config.get("use_remove_padding", False)
@@ -227,7 +232,10 @@ class DataParallelPPOActor(BasePPOActor):
         self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
 
         if self.config.entropy_from_logits_with_chunking:
-            entropy_from_logits = verl_F.entropy_from_logits_with_chunking
+            from functools import partial
+            entropy_from_logits = partial(
+                verl_F.entropy_from_logits_with_chunking, chunk_size=self.config.entropy_chunk_size
+            )
         else:
             entropy_from_logits = verl_F.entropy_from_logits
 
@@ -579,10 +587,12 @@ class DataParallelPPOActor(BasePPOActor):
                         log_probs = logprobs_from_logits(logits, micro_batch["responses"])
                     
                     if calculate_entropy:
+                        entropy_fn = (self.compute_entropy_from_logits if self.config.entropy_from_logits_with_chunking
+                                      else verl_F.entropy_from_logits)
                         if not self.config.entropy_checkpointing:
-                            entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
+                            entropy = entropy_fn(logits)  # (bsz, response_length)
                         else:
-                            entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
+                            entropy = torch.utils.checkpoint.checkpoint(entropy_fn, logits)
                     
                     if need_topk:
                         if student_top_k_ids is not None:
@@ -1105,6 +1115,11 @@ class DataParallelPPOActor(BasePPOActor):
         ):
             raise ValueError("early gradient offload requires one fixed training micro-batch per step")
         on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1 and not pipeline
+        # GSPO explicitly uses a sequence mean regardless of loss_agg_mode.
+        global_token_mean = (
+            self._global_token_mean and self.config.loss_agg_mode == "token-mean"
+            and self.config.policy_loss.get("loss_mode", "vanilla") != "gspo"
+        )
 
         metrics = {}
         for _ in range(self.config.ppo_epochs):
@@ -1119,6 +1134,25 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batches = mini_batch.split(micro_batch_size)
 
                 self.actor_optimizer.zero_grad()
+
+                token_mean_scales = None
+                if global_token_mean:
+                    # One NCCL reduction per optimizer mini-batch. Every micro-batch
+                    # uses this same denominator, including during accumulation.
+                    mask = mini_batch.batch["response_mask"]
+                    policy_mask = mask
+                    if (
+                        self.config.policy_loss.get("loss_mode", "vanilla") == "vanilla"
+                        and "format_mask" in mini_batch.batch
+                    ):
+                        policy_mask = mask * mini_batch.batch["format_mask"].reshape(-1, 1)
+                    counts = torch.stack((mask.sum(dtype=torch.int64), policy_mask.sum(dtype=torch.int64)))
+                    counts = counts.to(get_device_id())
+                    group = self.actor_module.process_group
+                    torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.SUM, group=group)
+                    # Zero-token ranks contribute zero; an entirely masked batch
+                    # also remains finite. FSDP's gradient average cancels world_size.
+                    token_mean_scales = torch.distributed.get_world_size(group) / counts.clamp_min(1)
 
                 for micro_batch in micro_batches:
                     micro_batch = micro_batch.to(get_device_id())
@@ -1145,9 +1179,13 @@ class DataParallelPPOActor(BasePPOActor):
                     # (moved below the forward pass -- see the M1 application site.)
 
                     entropy_coeff = self.config.entropy_coeff
-                    loss_agg_mode = self.config.loss_agg_mode
+                    loss_agg_mode = "token-sum" if global_token_mean else self.config.loss_agg_mode
 
-                    if self.config.use_dynamic_bsz:
+                    if global_token_mean:
+                        # Sums are already normalized over the whole mini-batch;
+                        # dividing by the micro-batch count would normalize twice.
+                        loss_scale_factor = 1.0
+                    elif self.config.use_dynamic_bsz:
                         loss_scale_factor = response_mask.shape[0] / mini_batch_size
                     else:
                         loss_scale_factor = 1 / self.gradient_accumulation
@@ -1201,7 +1239,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                     else:
                         with _actor_update_nvtx("forward"):
-                            _, log_prob, *_ = self._forward_micro_batch(
+                            entropy, log_prob, *_ = self._forward_micro_batch(
                                 model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                             )
                         log_prob_for_loss = log_prob
@@ -1228,6 +1266,8 @@ class DataParallelPPOActor(BasePPOActor):
                         format_mask = None
                         if "format_mask" in model_inputs.keys():
                             format_mask = model_inputs["format_mask"]
+                            if global_token_mean:
+                                format_mask = format_mask.reshape(-1)
 
 
                         # for fully_async_policy recipe
@@ -1284,11 +1324,15 @@ class DataParallelPPOActor(BasePPOActor):
                             format_mask=format_mask,
                         )
                         micro_batch_metrics.update(pg_metrics)
+                        if token_mean_scales is not None:
+                            pg_loss = pg_loss * token_mean_scales[1]
 
                         if entropy_coeff != 0:
                             entropy_loss = agg_loss(
                                 loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode
                             )
+                            if token_mean_scales is not None:
+                                entropy_loss = entropy_loss * token_mean_scales[0]
 
                             # compute policy loss
                             policy_loss = pg_loss - entropy_loss * entropy_coeff
@@ -1302,6 +1346,8 @@ class DataParallelPPOActor(BasePPOActor):
                                 logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
                             )
                             kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                            if token_mean_scales is not None:
+                                kl_loss = kl_loss * token_mean_scales[0]
 
                             policy_loss = policy_loss + kl_loss * effective_kl_loss_coef
                             micro_batch_metrics["actor/kl_loss"] = kl_loss.detach().item() * loss_scale_factor

@@ -1044,7 +1044,8 @@ def agg_loss(loss_mat: torch.Tensor, loss_mask: torch.Tensor, loss_agg_mode: str
             shape: (bs, response_length)
         loss_mask: `(torch.Tensor)`:
             shape: (bs, response_length)
-        loss_agg_mode: (str) choices:
+        loss_agg_mode: (str) choices (token-sum is an internal mode for a
+            caller that supplies a global token-mean denominator):
             method to aggregate the loss matrix into a scalar.
     Returns:
         loss: `a scalar torch.Tensor`
@@ -1052,6 +1053,8 @@ def agg_loss(loss_mat: torch.Tensor, loss_mask: torch.Tensor, loss_agg_mode: str
     """
     if loss_agg_mode == "token-mean":
         loss = verl_F.masked_mean(loss_mat, loss_mask)
+    elif loss_agg_mode == "token-sum":
+        loss = verl_F.masked_sum(loss_mat.float(), loss_mask)
     elif loss_agg_mode == "seq-mean-token-sum":
         seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)  # token-sum
         seq_mask = (torch.sum(loss_mask, dim=-1) > 0).float()  # exclude fully masked sequences

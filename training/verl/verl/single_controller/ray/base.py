@@ -13,6 +13,7 @@
 # limitations under the License.
 import inspect
 import logging
+import os
 import socket
 from copy import deepcopy
 from typing import Any, Optional
@@ -409,6 +410,10 @@ class RayWorkerGroup(WorkerGroup):
                         )
                         raise ValueError(f"Cannot override protected system env: {conflict_env_vars}")
                     env_vars.update(worker_env)
+                # Every colocated role must resolve the same named CPU mappings,
+                # even when worker runtime_env overrides the parent's env_vars.
+                if os.environ.get("OPENMOPD_CPU_STATE_NAMESPACE"):
+                    env_vars["OPENMOPD_CPU_STATE_NAMESPACE"] = os.environ["OPENMOPD_CPU_STATE_NAMESPACE"]
                 import re
 
                 cia_name = type(ray_cls_with_init.cls).__name__
