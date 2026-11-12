@@ -114,3 +114,23 @@ This is a small-model integration acceptance, not a full Ray trainer launch or
 a run with the production teacher checkpoints; full worker initialization and
 Ray RPC wrappers are bypassed, but scoring, actor update, FSDP/NCCL, shared Adam,
 and vLLM generation execute on real GPUs.
+
+## Shared Adam CPU gradient reduction
+
+Shared mode requires `multi_gpu.gradient_sync=cpu_reduce` (the r2.sh default).
+All forward/backward micro-batches run under FSDP `no_sync()`. Each rank writes
+its local accumulated gradients to its own FP32 named shared CPU buffer using
+blocking D2H. After a barrier the owner averages all rank buffers, computes the
+global norm and clips on CPU, then performs one AdamW update. Missing gradients
+contribute zero; parameters absent on every rank skip AdamW/weight decay.
+Nonfinite reduced norms cause all ranks to skip the update and publication.
+Each rank copies updated shared Student weights H2D; no GPU parameter broadcast
+is performed. Scalar version checks, token counts and barriers still use the
+existing process group. Separate-state mode continues to use FSDP all-reduce.
+
+The shared-state GPU test checks local gradients before reduction, CPU reduced
+and clipped gradients against a global-batch reference, nonfinite skipping,
+owner-only AdamW, and fails if parameter broadcast is called during updates.
+Rank buffers require `world_size * parameter_count * 4` CPU bytes, plus one
+FP32 reduced-gradient buffer. They are transient workspace, excluded from
+optimizer checkpoints; masters/moments remain shared and restored in place.

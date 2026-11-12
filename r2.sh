@@ -201,6 +201,12 @@ fi
 export PATH="$(dirname "${python_bin}"):${PATH}"
 export PYTHONPATH="${repo_root}/training/verl${PYTHONPATH:+:${PYTHONPATH}}"
 
+if [[ "${MULTI_GPU_CPU_STATE_MODE}" == "separate" ]]; then
+  MULTI_GPU_GRADIENT_SYNC="${MULTI_GPU_GRADIENT_SYNC:-auto_all_reduce}"
+else
+  MULTI_GPU_GRADIENT_SYNC="${MULTI_GPU_GRADIENT_SYNC:-cpu_reduce}"
+fi
+
 cmd=("${python_bin}" -m verl.trainer.main_ppo
   trainer.step_memory.enabled="${STEP_MEMORY_ENABLED}"
   algorithm.adv_estimator=token_reward_direct
@@ -217,7 +223,7 @@ cmd=("${python_bin}" -m verl.trainer.main_ppo
   actor_rollout_ref.rollout.multi_gpu.mode="${MULTI_GPU_MODE}"
   actor_rollout_ref.rollout.multi_gpu.cpu_state_mode="${MULTI_GPU_CPU_STATE_MODE}"
   actor_rollout_ref.rollout.multi_gpu.optimizer_owner_rank="${MULTI_GPU_OPTIMIZER_OWNER_RANK}"
-  actor_rollout_ref.rollout.multi_gpu.gradient_sync=auto_all_reduce
+  actor_rollout_ref.rollout.multi_gpu.gradient_sync="${MULTI_GPU_GRADIENT_SYNC:-cpu_reduce}"
   actor_rollout_ref.rollout.multi_gpu.synchronous_update=true
   actor_rollout_ref.rollout.multi_gpu.verify_policy_version=true
   actor_rollout_ref.rollout.name=vllm

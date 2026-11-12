@@ -143,17 +143,25 @@ def gpu_worker():
         data = torch.arange(12, dtype=torch.float32).reshape(4, 3) / 12
         step_reports = []
         for expected_step in (1, 2):
-            actor(data[rank:rank + 1].cuda()).square().mean().backward()
+            with actor.no_sync():
+                actor(data[rank:rank + 1].cuda()).square().mean().backward()
             reference(data).square().mean().backward()
-            # Compare the reduced gradients BEFORE clipping/update/publication.
-            for actual, target in zip(student.parameters(), reference.parameters(), strict=True):
+            # FSDP must leave rank-local gradients untouched before CPU reduction.
+            local = make_model()
+            local.load_state_dict(reference.state_dict())
+            local(data[rank:rank + 1]).square().mean().backward()
+            for actual, target in zip(student.parameters(), local.parameters(), strict=True):
                 torch.testing.assert_close(actual.grad.cpu(), target.grad, atol=2e-6, rtol=2e-5)
-            with patch.object(optimizer.cpu_optimizer, 'step', wraps=optimizer.cpu_optimizer.step) as step:
+            with patch.object(optimizer.cpu_optimizer, 'step', wraps=optimizer.cpu_optimizer.step) as step, \
+                    patch.object(dist, 'broadcast', side_effect=AssertionError('GPU parameter broadcast')):
                 norm = DataParallelPPOActor._optimizer_step(learner)
             calls = torch.tensor([step.call_count], device=device)
             dist.all_reduce(calls)
             assert calls.item() == 1, 'AdamW executed more or less than once across four ranks'
-            torch.nn.utils.clip_grad_norm_(reference.parameters(), 0.1)
+            reference_norm = torch.nn.utils.clip_grad_norm_(reference.parameters(), 0.1)
+            torch.testing.assert_close(norm.cpu(), reference_norm, atol=2e-6, rtol=2e-5)
+            for (_, _, reduced), target in zip(optimizer.grad_buffers, reference.parameters(), strict=True):
+                torch.testing.assert_close(reduced, target.grad, atol=2e-6, rtol=2e-5)
             reference_optimizer.step()
             for actual, target in zip(student.parameters(), reference.parameters(), strict=True):
                 torch.testing.assert_close(actual.cpu(), target, atol=2e-6, rtol=2e-5)
@@ -179,18 +187,20 @@ def gpu_worker():
             parameters_before = [p.detach().clone() for p in student.parameters()]
             state_before = copy.deepcopy(optimizer.state_dict())
             version_before = optimizer.publisher.version
-            output = actor(data[rank:rank + 1].cuda())
-            if rank == 3:
-                def poison(gradient):
-                    gradient = gradient.clone()
-                    gradient.reshape(-1)[0] = bad_value
-                    return gradient
-                output.register_hook(poison)
-            output.square().mean().backward()
-            with patch.object(optimizer.cpu_optimizer, 'step', wraps=optimizer.cpu_optimizer.step) as step:
+            with actor.no_sync():
+                output = actor(data[rank:rank + 1].cuda())
+                if rank == 3:
+                    def poison(gradient):
+                        gradient = gradient.clone()
+                        gradient.reshape(-1)[0] = bad_value
+                        return gradient
+                    output.register_hook(poison)
+                output.square().mean().backward()
+            with patch.object(optimizer.cpu_optimizer, 'step', wraps=optimizer.cpu_optimizer.step) as step, \
+                    patch.object(dist, 'broadcast', side_effect=AssertionError('GPU parameter broadcast')):
                 norm = DataParallelPPOActor._optimizer_step(learner)
             finite = torch.isfinite(norm).to(dtype=torch.int32).reshape(1)
-            dist.all_reduce(finite)
+            dist.all_reduce(finite.to(device))
             assert finite.item() == 0, 'ranks disagree about skipping nonfinite gradients'
             assert step.call_count == 0
             assert optimizer.publisher.version == version_before
@@ -376,10 +386,11 @@ def rollout_worker():
             from test_mopd_closed_loop import run_mopd_step
             run_mopd_step(actor, optimizer, before, model_config, device)
         else:
-            logits = actor(prompt).logits
-            # Different per-rank targets ensure this is a real distributed update.
-            torch.nn.functional.cross_entropy(logits[:, -1].float(),
-                                             torch.tensor([7 + rank], device=device)).backward()
+            with actor.no_sync():
+                logits = actor(prompt).logits
+                # Different per-rank targets ensure this is a real distributed update.
+                torch.nn.functional.cross_entropy(logits[:, -1].float(),
+                                                 torch.tensor([7 + rank], device=device)).backward()
             learner = SimpleNamespace(config=SimpleNamespace(grad_clip=1.0), actor_module=actor,
                                       actor_optimizer=optimizer)
             norm = DataParallelPPOActor._optimizer_step(learner)

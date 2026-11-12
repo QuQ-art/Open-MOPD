@@ -86,6 +86,57 @@ lines += ['', '共享 Adam 的 master/moments/student 原位恢复到新建具�
     '- train4096_idle：启动空闲检查通过，无外部干扰时 backward 超出 PyTorch 配额；未完成 step。',
     '  退出期间监控曾将已脱离父进程的本次 Ray worker 误认为外部进程，已改为保留本次 worker PID 记录。',
     '- 各次配置、日志与 GPU 采样均保留在 reports/、logs/、profiles/。', '']
+if len(sys.argv) > 4:
+    baseline_root = Path(sys.argv[4])
+    baseline = json.loads((baseline_root / 'reports/metrics.json').read_text())
+    comparisons = []
+    for old, new in zip(baseline['train']['metrics'] + baseline['resume']['metrics'], rows, strict=True):
+        assert old['step'] == new['step']
+        comparisons.append({'step':new['step'], **{
+            key: {'gpu_reduce':old['data'][key], 'cpu_reduce':new['data'][key],
+                  'speedup':old['data'][key] / new['data'][key]}
+            for key in ['timing_s/step', 'timing_s/update_actor', 'timing_s/gen',
+                        'response_length/mean']}})
+    config_differences = {}
+    import yaml
+    def flatten(value, prefix=''):
+        if isinstance(value, dict):
+            return {k:v for key, item in value.items() for k,v in flatten(item, prefix + str(key) + '.').items()}
+        return {prefix.rstrip('.'):value}
+    for label in [train_label, resume_label]:
+        old = flatten(yaml.safe_load((baseline_root / f'reports/{label}_config.txt').read_text().split('Resolved config:\n')[-1]))
+        new = flatten(yaml.safe_load((root / f'reports/{label}_config.txt').read_text().split('Resolved config:\n')[-1]))
+        changes = {key:{'before':old.get(key), 'after':new.get(key)} for key in old.keys() | new.keys()
+                   if old.get(key) != new.get(key)}
+        config_differences[label] = changes
+        allowed = {'actor_rollout_ref.rollout.multi_gpu.gradient_sync', 'trainer.experiment_name',
+                   'trainer.default_local_dir', 'trainer.resume_from_path', 'ray_kwargs.ray_init._temp_dir'}
+        checks[label + '_same_training_config'] = all(key in allowed or key.endswith('save_path') for key in changes)
+    averages = {}
+    for key in ['timing_s/step', 'timing_s/update_actor', 'timing_s/gen', 'response_length/mean']:
+        old_mean = sum(row[key]['gpu_reduce'] for row in comparisons) / len(comparisons)
+        new_mean = sum(row[key]['cpu_reduce'] for row in comparisons) / len(comparisons)
+        averages[key] = {'gpu_reduce':old_mean, 'cpu_reduce':new_mean,
+                         'speedup':old_mean / new_mean, 'time_reduction_pct':100 * (1 - new_mean / old_mean)}
+    report['comparison_averages'] = averages
+    report['comparison'] = comparisons
+    report['config_differences'] = config_differences
+    report['baseline'] = str(baseline_root)
+    report['passed'] = all(checks.values())
+    (root / 'reports/metrics.json').write_text(json.dumps(report, indent=2))
+    lines = lines[:lines.index('## 历史尝试')]
+    lines += ['## CPU reduce 对比', '', f'历史 GPU reduce 基线：{baseline_root}',
+              '本轮沿用基线最终成功配置；上述显存调整是基线已经使用的设置，本轮没有重新调整。',
+              '当前共享优化器使用 FSDP no_sync、各 rank D2H、CPU 平均与裁剪、owner AdamW、各 rank H2D；无 GPU 参数广播。',
+              '这里只比较历史运行，未做交错重复的严格性能基准；生成长度差异也会影响整步耗时。', '',
+              '| Step | GPU reduce 整步秒 | CPU reduce 整步秒 | GPU reduce update_actor 秒 | CPU reduce update_actor 秒 |',
+              '|---|---|---|---|---|']
+    for row in comparisons:
+        lines.append('| ' + ' | '.join(str(v) for v in [row['step'], row['timing_s/step']['gpu_reduce'],
+            row['timing_s/step']['cpu_reduce'], row['timing_s/update_actor']['gpu_reduce'],
+            row['timing_s/update_actor']['cpu_reduce']]) + ' |')
+    lines += ['', '五步平均（整步不包含 checkpoint 保存）：', '', json.dumps(averages, indent=2),
+              '', '配置差异和完整比较保存在 metrics.json。']
 (root / 'reports/summary.md').write_text('\n'.join(lines))
 print(json.dumps({'passed':report['passed'], 'checks':checks,'gpu_sampled_peak_mib':peaks},indent=2))
 raise SystemExit(0 if report['passed'] else 1)

@@ -32,10 +32,11 @@ def validate_multi_gpu(get):
     require(get("trainer.nnodes", 1) == 1, "only one node is supported")
     require(get(multi + "mode", "replicated_dp") == "replicated_dp",
             "only mode=replicated_dp is implemented; sharded_dp/pipeline_parallel are unsupported")
-    require(get(multi + "gradient_sync", "auto_all_reduce") == "auto_all_reduce",
-            "gradient_sync must be auto_all_reduce (FSDP NO_SHARD owns reduction)")
-    require(get(multi + "cpu_state_mode", "shared") in ("shared", "separate"),
-            "cpu_state_mode must be shared or separate")
+    state_mode = get(multi + "cpu_state_mode", "shared")
+    require(state_mode in ("shared", "separate"), "cpu_state_mode must be shared or separate")
+    expected_sync = "cpu_reduce" if state_mode == "shared" else "auto_all_reduce"
+    require(get(multi + "gradient_sync", expected_sync) == expected_sync,
+            f"cpu_state_mode={state_mode} requires gradient_sync={expected_sync}")
     require(get("data.token_batching.enabled", False) is False,
             "data.token_batching.enabled must be false (single-GPU slot pipeline only)")
     if get(multi + "cpu_state_mode", "shared") == "shared":

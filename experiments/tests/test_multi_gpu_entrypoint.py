@@ -31,7 +31,7 @@ class MultiGPUEntrypointTests(unittest.TestCase):
         for count in ('2', '4'):
             result = self.launch(OPENMOPD_N_GPUS_PER_NODE=count)
             self.assertEqual(result.returncode, 0, result.stderr)
-            for option in ('multi_gpu.enable=true', 'share_weights=false',
+            for option in ('multi_gpu.enable=true', 'multi_gpu.gradient_sync=cpu_reduce', 'share_weights=false',
                            'student_teacher_pipeline=false', 'pipeline_overlap=false'):
                 self.assertIn(option, result.stdout)
 
@@ -48,6 +48,7 @@ class MultiGPUEntrypointTests(unittest.TestCase):
             'actor_rollout_ref.rollout.multi_gpu.optimizer_owner_rank=-1': 'optimizer_owner_rank',
             'actor_rollout_ref.rollout.multi_gpu.synchronous_update=false': 'synchronous_update',
             'actor_rollout_ref.rollout.multi_gpu.gradient_sync=none': 'gradient_sync',
+            'actor_rollout_ref.rollout.multi_gpu.gradient_sync=auto_all_reduce': 'requires gradient_sync=cpu_reduce',
             'actor_rollout_ref.rollout.multi_gpu.cpu_state_mode=invalid': 'cpu_state_mode',
             'actor_rollout_ref.rollout.pipeline_overlap=true': 'pipeline_overlap',
             'actor_rollout_ref.rollout.tensor_model_parallel_size=2': 'tensor_model_parallel_size',

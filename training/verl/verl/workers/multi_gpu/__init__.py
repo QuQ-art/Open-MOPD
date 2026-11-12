@@ -15,7 +15,7 @@
 """Synchronous replicated-DP components; independent of single-GPU pipelines.
 
 Shared mode uses named CPU mappings and an authoritative optimizer writer.
-Separate mode retains independent optimizer states. FSDP owns gradient reduction.
+Shared mode reduces gradients on CPU; separate mode retains FSDP reduction.
 """
 import torch
 import torch.distributed as dist
@@ -51,10 +51,11 @@ class MultiGPUWeightPublisher:
         self.version = 0
 
     @torch.no_grad()
-    def publish(self, parameters):
+    def publish(self, parameters, *, broadcast_parameters=True):
         parameters = list(parameters)
-        for parameter in parameters:
-            dist.broadcast(parameter.data, src=self.owner_rank)
+        if broadcast_parameters:
+            for parameter in parameters:
+                dist.broadcast(parameter.data, src=self.owner_rank)
         self.version += 1
         self.assert_version(parameters)
 

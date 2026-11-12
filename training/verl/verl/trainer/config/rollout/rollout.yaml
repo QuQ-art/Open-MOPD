@@ -386,7 +386,7 @@ multi_gpu:
   # Currently only replicated_dp is implemented; other modes fail preflight.
   mode: replicated_dp
 
-  gradient_sync: auto_all_reduce
+  gradient_sync: cpu_reduce
 
   # shared: one optimizer owner; separate: state per rank. No interprocess pointer aliasing.
   cpu_state_mode: shared

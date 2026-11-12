@@ -25,6 +25,7 @@ from .cpu_state_store import CPUStateStore, distributed_tensor
 
 class SharedCPUAdamW(torch.optim.Optimizer):
     _persistent_shared_cpu_state = True
+    gradient_sync = "cpu_reduce"
 
     def __init__(self, optimizer, owner_rank, publisher):
         if optimizer.state:
@@ -34,6 +35,9 @@ class SharedCPUAdamW(torch.optim.Optimizer):
         self.publisher = publisher
         self.store = CPUStateStore.from_environment()
         self.pairs = []
+        self.grad_buffers = []
+        self.world_size = dist.get_world_size()
+        self._prepared = False
         groups = []
         for group_index, group in enumerate(self.param_groups):
             if group.get("amsgrad", False) or group.get("maximize", False):
@@ -56,7 +60,13 @@ class SharedCPUAdamW(torch.optim.Optimizer):
                 self.state[param] = state
                 self.pairs.append((param, master, host))
                 masters.append(master)
+                slots = allocate("gradient/rank_slots", torch.float32, shape=(self.world_size, *param.shape))
+                present = allocate("gradient/present", torch.bool, shape=(self.world_size,))
+                reduced = allocate("gradient/reduced", torch.float32)
+                self.grad_buffers.append((slots, present, reduced))
             groups.append(dict(params=masters, **self._options(group)))
+        self.grad_norm = distributed_tensor(self.store, "gradient", "norm", (), torch.float32,
+                                            owner_rank=owner_rank)
         self.cpu_optimizer = torch.optim.AdamW(groups, foreach=False)
         for param, master, _ in self.pairs:
             self.cpu_optimizer.state[master] = {
@@ -68,22 +78,57 @@ class SharedCPUAdamW(torch.optim.Optimizer):
         return {key: group[key] for key in ("lr", "betas", "eps", "weight_decay") if key in group}
 
     @torch.no_grad()
+    def clip_grad_norm_(self, max_norm):
+        """Blocking per-rank D2H, CPU mean reduction, then global CPU clipping."""
+        rank = dist.get_rank()
+        for (param, _, _), (slots, present, _) in zip(self.pairs, self.grad_buffers, strict=True):
+            present[rank] = param.grad is not None
+            if param.grad is None:
+                slots[rank].zero_()
+            else:
+                slots[rank].copy_(param.grad.detach(), non_blocking=False)
+        dist.barrier()  # All D2H writes complete before the owner reads any slot.
+        if rank == self.owner_rank:
+            for (_, master, _), (slots, present, reduced) in zip(self.pairs, self.grad_buffers, strict=True):
+                if present.any():
+                    torch.sum(slots, dim=0, out=reduced)
+                    reduced.div_(self.world_size)
+                    master.grad = reduced
+                else:
+                    master.grad = None
+            norm = torch.nn.utils.clip_grad_norm_([master for _, master, _ in self.pairs], max_norm)
+            self.grad_norm.copy_(norm)
+        dist.barrier()
+        self._prepared = True
+        return self.grad_norm.clone()
+
+    @torch.no_grad()
     def step(self, closure=None):
         if closure is not None:
             raise ValueError("SharedCPUAdamW does not support closures")
+        if not self._prepared:
+            self.clip_grad_norm_(float("inf"))
+        if not torch.isfinite(self.grad_norm):
+            self.zero_grad()
+            return
         if dist.get_rank() == self.owner_rank:
             for source, target in zip(self.param_groups, self.cpu_optimizer.param_groups, strict=True):
                 target.update(self._options(source))
-            for param, master, _ in self.pairs:
-                master.grad = None if param.grad is None else param.grad.detach().to(device="cpu", dtype=torch.float32)
             self.cpu_optimizer.step()
             for _, master, host in self.pairs:
                 host.copy_(master)
                 master.grad = None
-        dist.barrier()  # Make completed shared writes visible before H2D.
+        dist.barrier()  # Completed shared weights are visible before each rank's H2D.
         for param, _, host in self.pairs:
             param.copy_(host)
-        self.publisher.publish(param for param, _, _ in self.pairs)
+        self.publisher.publish((param for param, _, _ in self.pairs), broadcast_parameters=False)
+        self._prepared = False
+
+    def zero_grad(self, set_to_none=True):
+        super().zero_grad(set_to_none=set_to_none)
+        for _, master, _ in self.pairs:
+            master.grad = None
+        self._prepared = False
 
     def state_dict(self):
         state = super().state_dict()
