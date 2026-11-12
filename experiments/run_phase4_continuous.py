@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import signal
+import shutil
 import psutil
 import threading
 import time
@@ -109,7 +110,8 @@ def monitor():
                     interference.append({'timestamp':time.time(), 'pids':foreign})
                     print(f'External GPU processes detected: {foreign}; interrupting this experiment only', flush=True)
                     process.send_signal(signal.SIGINT)
-                row = {'timestamp':time.time(), 'foreign_pids':foreign, 'gpus':[[int(x.strip()) for x in line.split(',')]
+                row = {'timestamp':time.time(), 'shm_used_bytes':shutil.disk_usage('/dev/shm').used,
+                       'foreign_pids':foreign, 'gpus':[[int(x.strip()) for x in line.split(',')]
                        for line in raw.strip().splitlines()]}
                 fp.write(json.dumps(row) + '\n'); fp.flush()
             except Exception as error:

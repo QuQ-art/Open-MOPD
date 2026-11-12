@@ -136,11 +136,15 @@ def gpu_worker():
                      sharding_strategy=MultiGPUGradientSync.sharding_strategy(), sync_module_states=True)
         student_store.finish_initialization()
         optimizer = SharedCPUAdamW(torch.optim.AdamW(actor.parameters(), lr=0.01), 1,
-                                   MultiGPUWeightPublisher(1))
+                                   MultiGPUWeightPublisher(1), chunk_bytes=28)
         reference_optimizer = torch.optim.AdamW(reference.parameters(), lr=0.01, foreach=False)
         learner = SimpleNamespace(config=SimpleNamespace(grad_clip=0.1), actor_module=actor,
                                   actor_optimizer=optimizer)
         data = torch.arange(12, dtype=torch.float32).reshape(4, 3) / 12
+        assert len(optimizer.chunks) > 1
+        assert any(len(chunk) > 1 for chunk in optimizer.chunks), 'must pack across parameter boundaries'
+        assert optimizer.workspace.numel() * optimizer.workspace.element_size() == 4 * 28
+        assert not any(item['model'] == 'gradient/rank_slots' for item in optimizer.store.inventory())
         step_reports = []
         for expected_step in (1, 2):
             with actor.no_sync():
@@ -152,7 +156,20 @@ def gpu_worker():
             local(data[rank:rank + 1]).square().mean().backward()
             for actual, target in zip(student.parameters(), local.parameters(), strict=True):
                 torch.testing.assert_close(actual.grad.cpu(), target.grad, atol=2e-6, rtol=2e-5)
-            with patch.object(optimizer.cpu_optimizer, 'step', wraps=optimizer.cpu_optimizer.step) as step, \
+            gpu_means = []
+            for parameter in student.parameters():
+                mean = parameter.grad.detach().clone()
+                dist.all_reduce(mean)
+                gpu_means.append(mean.cpu() / dist.get_world_size())
+            raw_reduce = optimizer._reduce_chunk
+            def checked_reduce(segments):
+                raw_reduce(segments)
+                for index, offset, _, size in segments:
+                    actual = optimizer.grad_buffers[index][1].view(-1)[offset:offset + size]
+                    expected = gpu_means[index].view(-1)[offset:offset + size]
+                    torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-5)
+            with patch.object(optimizer, '_reduce_chunk', side_effect=checked_reduce), \
+                    patch.object(optimizer.cpu_optimizer, 'step', wraps=optimizer.cpu_optimizer.step) as step, \
                     patch.object(dist, 'broadcast', side_effect=AssertionError('GPU parameter broadcast')):
                 norm = DataParallelPPOActor._optimizer_step(learner)
             calls = torch.tensor([step.call_count], device=device)
@@ -160,7 +177,7 @@ def gpu_worker():
             assert calls.item() == 1, 'AdamW executed more or less than once across four ranks'
             reference_norm = torch.nn.utils.clip_grad_norm_(reference.parameters(), 0.1)
             torch.testing.assert_close(norm.cpu(), reference_norm, atol=2e-6, rtol=2e-5)
-            for (_, _, reduced), target in zip(optimizer.grad_buffers, reference.parameters(), strict=True):
+            for (_, reduced), target in zip(optimizer.grad_buffers, reference.parameters(), strict=True):
                 torch.testing.assert_close(reduced, target.grad, atol=2e-6, rtol=2e-5)
             reference_optimizer.step()
             for actual, target in zip(student.parameters(), reference.parameters(), strict=True):
@@ -189,18 +206,21 @@ def gpu_worker():
             version_before = optimizer.publisher.version
             with actor.no_sync():
                 output = actor(data[rank:rank + 1].cuda())
-                if rank == 3:
+                if rank == 3 and bad_value != float('inf'):
                     def poison(gradient):
                         gradient = gradient.clone()
                         gradient.reshape(-1)[0] = bad_value
                         return gradient
                     output.register_hook(poison)
                 output.square().mean().backward()
+            if rank == 3 and bad_value == float('inf'):
+                list(student.parameters())[-1].grad.view(-1)[-1] = bad_value  # last chunk
             with patch.object(optimizer.cpu_optimizer, 'step', wraps=optimizer.cpu_optimizer.step) as step, \
                     patch.object(dist, 'broadcast', side_effect=AssertionError('GPU parameter broadcast')):
                 norm = DataParallelPPOActor._optimizer_step(learner)
             finite = torch.isfinite(norm).to(dtype=torch.int32).reshape(1)
-            dist.all_reduce(finite.to(device))
+            finite = finite.to(device)
+            dist.all_reduce(finite)
             assert finite.item() == 0, 'ranks disagree about skipping nonfinite gradients'
             assert step.call_count == 0
             assert optimizer.publisher.version == version_before
@@ -235,6 +255,21 @@ def gpu_worker():
         assert optimizer.publisher.version == checkpoint['published_version']
         torch.testing.assert_close(state['exp_avg'], before)
         assert pointers == [value.data_ptr() for item in optimizer.state.values() for value in item.values()]
+
+        # Continue after restore to verify both moments and publication state.
+        with actor.no_sync():
+            actor(data[rank:rank + 1].cuda()).square().mean().backward()
+        reference(data).square().mean().backward()
+        DataParallelPPOActor._optimizer_step(learner)
+        torch.nn.utils.clip_grad_norm_(reference.parameters(), 0.1)
+        reference_optimizer.step()
+        for actual, target in zip(student.parameters(), reference.parameters(), strict=True):
+            torch.testing.assert_close(actual.cpu(), target, atol=2e-6, rtol=2e-5)
+            for key in ('step', 'exp_avg', 'exp_avg_sq'):
+                torch.testing.assert_close(optimizer.state[actual][key], reference_optimizer.state[target][key],
+                                           atol=2e-6, rtol=2e-5)
+        assert optimizer.publisher.version == 3
+        optimizer.zero_grad()
 
         teachers = []
         for index in range(3):

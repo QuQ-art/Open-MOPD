@@ -27,7 +27,9 @@ class SharedCPUAdamW(torch.optim.Optimizer):
     _persistent_shared_cpu_state = True
     gradient_sync = "cpu_reduce"
 
-    def __init__(self, optimizer, owner_rank, publisher):
+    def __init__(self, optimizer, owner_rank, publisher, *, chunk_bytes=256 * 1024**2):
+        if type(chunk_bytes) is not int or chunk_bytes <= 0 or chunk_bytes % 4:
+            raise ValueError("CPU reduce chunk_bytes must be a positive multiple of four")
         if optimizer.state:
             raise ValueError("SharedCPUAdamW must be constructed before the first update")
         super().__init__(optimizer.param_groups, optimizer.defaults)
@@ -38,6 +40,10 @@ class SharedCPUAdamW(torch.optim.Optimizer):
         self.grad_buffers = []
         self.world_size = dist.get_world_size()
         self._prepared = False
+        self.chunk_elements = chunk_bytes // 4
+        self.workspace = distributed_tensor(self.store, "gradient/workspace", "rank_slots",
+                                            (self.world_size, self.chunk_elements), torch.float32,
+                                            owner_rank=owner_rank)
         groups = []
         for group_index, group in enumerate(self.param_groups):
             if group.get("amsgrad", False) or group.get("maximize", False):
@@ -60,11 +66,31 @@ class SharedCPUAdamW(torch.optim.Optimizer):
                 self.state[param] = state
                 self.pairs.append((param, master, host))
                 masters.append(master)
-                slots = allocate("gradient/rank_slots", torch.float32, shape=(self.world_size, *param.shape))
                 present = allocate("gradient/present", torch.bool, shape=(self.world_size,))
                 reduced = allocate("gradient/reduced", torch.float32)
-                self.grad_buffers.append((slots, present, reduced))
+                self.grad_buffers.append((present, reduced))
             groups.append(dict(params=masters, **self._options(group)))
+        # Pack parameters into fixed-capacity chunks; a chunk may cross parameter
+        # boundaries and a large parameter may span multiple chunks.
+        self.chunks = []
+        segments, used = [], 0
+        for index, (param, _, _) in enumerate(self.pairs):
+            offset = 0
+            while offset < param.numel():
+                size = min(param.numel() - offset, self.chunk_elements - used)
+                segments.append((index, offset, used, size))
+                offset += size
+                used += size
+                if used == self.chunk_elements:
+                    self.chunks.append(segments)
+                    segments, used = [], 0
+        if segments:
+            self.chunks.append(segments)
+        if dist.get_rank() == owner_rank:
+            print(f"CPU_REDUCE_WORKSPACE chunk_bytes_per_rank={chunk_bytes} "
+                  f"workspace_bytes={self.workspace.numel() * 4} "
+                  f"reduced_gradient_bytes={sum(p.numel() for p, _, _ in self.pairs) * 4} "
+                  f"chunks={len(self.chunks)}", flush=True)
         self.grad_norm = distributed_tensor(self.store, "gradient", "norm", (), torch.float32,
                                             owner_rank=owner_rank)
         self.cpu_optimizer = torch.optim.AdamW(groups, foreach=False)
@@ -81,26 +107,43 @@ class SharedCPUAdamW(torch.optim.Optimizer):
     def clip_grad_norm_(self, max_norm):
         """Blocking per-rank D2H, CPU mean reduction, then global CPU clipping."""
         rank = dist.get_rank()
-        for (param, _, _), (slots, present, _) in zip(self.pairs, self.grad_buffers, strict=True):
+        for (param, _, _), (present, _) in zip(self.pairs, self.grad_buffers, strict=True):
             present[rank] = param.grad is not None
-            if param.grad is None:
-                slots[rank].zero_()
-            else:
-                slots[rank].copy_(param.grad.detach(), non_blocking=False)
-        dist.barrier()  # All D2H writes complete before the owner reads any slot.
+        for segments in self.chunks:
+            self._copy_chunk_to_cpu(segments, rank)
+            dist.barrier()  # Ready: all ranks completed blocking D2H.
+            if rank == self.owner_rank:
+                self._reduce_chunk(segments)
+            dist.barrier()  # Consumed: nobody may overwrite workspace before reduction.
+        # Also synchronize presence flags for empty-parameter models.
+        dist.barrier()
         if rank == self.owner_rank:
-            for (_, master, _), (slots, present, reduced) in zip(self.pairs, self.grad_buffers, strict=True):
-                if present.any():
-                    torch.sum(slots, dim=0, out=reduced)
-                    reduced.div_(self.world_size)
-                    master.grad = reduced
-                else:
-                    master.grad = None
+            for (_, master, _), (present, reduced) in zip(self.pairs, self.grad_buffers, strict=True):
+                master.grad = reduced if present.any() else None
             norm = torch.nn.utils.clip_grad_norm_([master for _, master, _ in self.pairs], max_norm)
             self.grad_norm.copy_(norm)
         dist.barrier()
         self._prepared = True
         return self.grad_norm.clone()
+
+    def _copy_chunk_to_cpu(self, segments, rank):
+        """Blocking transport interface; workspace ownership is rank-local."""
+        for index, offset, start, size in segments:
+            grad = self.pairs[index][0].grad
+            destination = self.workspace[rank, start:start + size]
+            if grad is None:
+                destination.zero_()
+            else:
+                # FSDP NO_SHARD gradients are contiguous; fail instead of making
+                # an unbounded full-size contiguous copy for unsupported layouts.
+                destination.copy_(grad.detach().view(-1)[offset:offset + size], non_blocking=False)
+
+    def _reduce_chunk(self, segments):
+        """Owner-only CPU mean directly into persistent reduced-gradient views."""
+        for index, offset, start, size in segments:
+            destination = self.grad_buffers[index][1].view(-1)[offset:offset + size]
+            torch.sum(self.workspace[:, start:start + size], dim=0, out=destination)
+            destination.div_(self.world_size)
 
     @torch.no_grad()
     def step(self, closure=None):

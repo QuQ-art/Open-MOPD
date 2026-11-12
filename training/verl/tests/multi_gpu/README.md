@@ -104,8 +104,18 @@ The signal is checked against `(teacher_logp - student_logp) * softmax(student_l
 The actor receives the local mini-batch size 1, corresponding to configured
 global mini-batch size 4, with one micro-batch and one epoch.
 
-Before clipping, reduced gradients must be finite and bitwise identical on all
-ranks. The underlying CPU AdamW must run exactly once globally, every state step
+Before CPU reduction, each rank's finite local gradients must match an independent
+unwrapped-model backward of the on-policy loss `-sum(A * log(pi))`, using the
+global token denominator (`atol=2e-5`, `rtol=2e-2` for BF16 backward). At least
+one parameter must have different gradients across ranks. The test gathers those
+local gradients for verification only and calculates their mean independently
+in FP64. Inside the owner's CPU clipping call, the named rank buffers must match
+the captured gradients exactly and the unclipped shared gradient must match that
+mean (`atol=2e-7`, `rtol=2e-5`). The fixture uses `grad_clip=1e-4` and requires
+clipping to be active; clipped gradients, norm, Adam moments and FP32 masters are
+checked against a CPU reference. Local GPU gradients must remain unchanged, and
+GPU parameter broadcast during the update fails the test.
+The underlying CPU AdamW must run exactly once globally, every state step
 must become 1, and the new Student parameters must change and match bitwise on
 all four GPUs. The subsequent real vLLM weight publication and generation are
 also checked against the new Student. Successful runs print `GPU_MOPD_PASS`
@@ -119,8 +129,9 @@ and vLLM generation execute on real GPUs.
 
 Shared mode requires `multi_gpu.gradient_sync=cpu_reduce` (the r2.sh default).
 All forward/backward micro-batches run under FSDP `no_sync()`. Each rank writes
-its local accumulated gradients to its own FP32 named shared CPU buffer using
-blocking D2H. After a barrier the owner averages all rank buffers, computes the
+its local accumulated gradients to its own fixed-capacity 256 MiB FP32 named
+shared CPU workspace using blocking D2H. Parameters are packed across chunk
+boundaries; each chunk has a ready barrier and a consumed barrier before reuse. After a barrier the owner averages all rank buffers, computes the
 global norm and clips on CPU, then performs one AdamW update. Missing gradients
 contribute zero; parameters absent on every rank skip AdamW/weight decay.
 Nonfinite reduced norms cause all ranks to skip the update and publication.
@@ -128,9 +139,13 @@ Each rank copies updated shared Student weights H2D; no GPU parameter broadcast
 is performed. Scalar version checks, token counts and barriers still use the
 existing process group. Separate-state mode continues to use FSDP all-reduce.
 
-The shared-state GPU test checks local gradients before reduction, CPU reduced
+The shared-state GPU test uses 28-byte rank workspaces to force parameter splits,
+packed chunks and a short final chunk. It compares chunks against GPU all-reduce,
+checks last-chunk Inf skipping and a further update after checkpoint restore.
+It checks local gradients before reduction, CPU reduced
 and clipped gradients against a global-batch reference, nonfinite skipping,
 owner-only AdamW, and fails if parameter broadcast is called during updates.
-Rank buffers require `world_size * parameter_count * 4` CPU bytes, plus one
-FP32 reduced-gradient buffer. They are transient workspace, excluded from
+Rank workspaces require `world_size * 256 MiB`, plus one full FP32 reduced-gradient
+buffer (`parameter_count * 4` bytes). Global norm/clipping happens only after all
+chunks complete; no partial Adam updates are allowed. They are transient workspace, excluded from
 optimizer checkpoints; masters/moments remain shared and restored in place.
