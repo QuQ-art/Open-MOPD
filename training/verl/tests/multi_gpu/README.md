@@ -150,6 +150,31 @@ buffer (`parameter_count * 4` bytes). Global norm/clipping happens only after al
 chunks complete; no partial Adam updates are allowed. They are transient workspace, excluded from
 optimizer checkpoints; masters/moments remain shared and restored in place.
 
+### Double Buffering and Async CPU Reduce
+
+`SharedCPUAdamW(..., reduce_mode=...)` supports `serial`, `double_buffer`, and `async`.
+The mode can also be set via `OPENMOPD_CPU_REDUCE_MODE` on all ranks; the default is `async`.
+
+- `serial` retains blocking D2H transfers into a single mmap workspace.
+- `double_buffer` uses two private pinned staging buffers and two shared workspaces, with blocking D2H transfers.
+- `async` overlaps D2H of the next chunk with the owner's CPU reduction of the current chunk using a dedicated CUDA stream.
+
+The CPU waits for the D2H completion event before reading the staging buffer and copying the valid region into the current shared workspace.
+A ready barrier ensures all ranks have published their data, while a consumed barrier prevents slot reuse until the owner finishes reduction.
+Global gradient norm computation, clipping, and AdamW updates occur after all chunks have been reduced. The backward path 
+and weight publication without GPU parameter broadcasts remain unchanged.
+
+With 256 MiB per rank, shared workspace usage increases from 1 GiB to 2 GiB, with an additional 2 GiB of pinned staging buffers across four ranks.
+The full reduced-gradient buffer remains unchanged, and temporary buffers are excluded from checkpoints.
+
+`last_reduce_metrics` records D2H time, completion wait time, staging-to-shared memory copy time, owner reduction time, barrier time, 
+total transport time, and total time including gradient norm computation and clipping. Overlapping stage times should not be summed directly.
+
+Run `experiments/run_cpu_reduce_async.py --output /mnt/sda1/zst/RONDO/experiments/<run>` to wait until all four GPUs have been idle for 60 seconds, 
+validate the three modes, and run a paired performance benchmark using the production Student parameter count.
+
+`experiments/summarize_cpu_reduce_async.py <run>` generates the report. This microbenchmark excludes rollout, backward, 
+and AdamW updates and does not replace end-to-end training throughput validation.
 
 ### Sequential Teacher GPU slots
 
