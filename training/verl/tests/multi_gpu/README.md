@@ -150,25 +150,55 @@ buffer (`parameter_count * 4` bytes). Global norm/clipping happens only after al
 chunks complete; no partial Adam updates are allowed. They are transient workspace, excluded from
 optimizer checkpoints; masters/moments remain shared and restored in place.
 
-### 双缓冲与异步 CPU reduce
+### Double Buffering and Async CPU Reduce
 
-`SharedCPUAdamW(..., reduce_mode=...)` 支持 `serial`、`double_buffer`、`async`。
-也可在所有 rank 统一设置 `OPENMOPD_CPU_REDUCE_MODE`；默认 `async`。
-`serial` 保留原来的阻塞 D2H 到单个 mmap workspace；`double_buffer` 使用
-两个私有 pinned staging 与两个共享 workspace，但 D2H 阻塞；`async` 在独立
-CUDA stream 上把下一块 D2H 与 owner 当前块 CPU reduce 重叠。
+`SharedCPUAdamW(..., reduce_mode=...)` supports `serial`, `double_buffer`, and `async`.
+The mode can also be set via `OPENMOPD_CPU_REDUCE_MODE` on all ranks; the default is `async`.
 
-CPU 必须等待 D2H completion event 后才能读 staging，并将有效区间复制到
-当前共享 workspace。ready barrier 确认所有 rank 发布完成，consumed barrier
-保证 owner reduce 完成后才复用槽。所有 chunks 完成后统一计算全局 norm、裁剪
-和执行 AdamW；backward 与无 GPU 参数广播的权重发布路径不变。
+- `serial` retains blocking D2H transfers into a single mmap workspace.
+- `double_buffer` uses two private pinned staging buffers and two shared workspaces, with blocking D2H transfers.
+- `async` overlaps D2H of the next chunk with the owner's CPU reduction of the current chunk using a dedicated CUDA stream.
 
-256 MiB/rank 时共享 workspace 从 1 GiB 增至 2 GiB，另有四 rank 合计 2 GiB
-的 pinned staging；完整 reduced-gradient 缓冲不变。scratch 不进 checkpoint。
-`last_reduce_metrics` 包含 D2H、completion 等待、staging→shared memcpy、owner
-reduce、barrier、transport 总耗时及含 norm/clip 的总耗时；overlap 分项不可相加。
+The CPU waits for the D2H completion event before reading the staging buffer and copying the valid region into the current shared workspace.
+A ready barrier ensures all ranks have published their data, while a consumed barrier prevents slot reuse until the owner finishes reduction.
+Global gradient norm computation, clipping, and AdamW updates occur after all chunks have been reduced. The backward path 
+and weight publication without GPU parameter broadcasts remain unchanged.
 
-运行 `experiments/run_cpu_reduce_async.py --output /mnt/sda1/zst/RONDO/experiments/<run>`，
-等待四卡空闲 60 秒后依次验证三模式，再以正式 Student 参数量做配对性能测试。
-`experiments/summarize_cpu_reduce_async.py <run>` 生成报告。该 microbenchmark 不包含
-rollout/backward/AdamW，不能替代完整训练吞吐验收。
+With 256 MiB per rank, shared workspace usage increases from 1 GiB to 2 GiB, with an additional 2 GiB of pinned staging buffers across four ranks.
+The full reduced-gradient buffer remains unchanged, and temporary buffers are excluded from checkpoints.
+
+`last_reduce_metrics` records D2H time, completion wait time, staging-to-shared memory copy time, owner reduction time, barrier time, 
+total transport time, and total time including gradient norm computation and clipping. Overlapping stage times should not be summed directly.
+
+Run `experiments/run_cpu_reduce_async.py --output /mnt/sda1/zst/RONDO/experiments/<run>` to wait until all four GPUs have been idle for 60 seconds, 
+validate the three modes, and run a paired performance benchmark using the production Student parameter count.
+
+`experiments/summarize_cpu_reduce_async.py <run>` generates the report. This microbenchmark excludes rollout, backward, 
+and AdamW updates and does not replace end-to-end training throughput validation.
+
+### Sequential Teacher GPU slots
+
+Enable `actor_rollout_ref.rollout.teacher_layer_pipeline=true` (or
+`TEACHER_LAYER_PIPELINE=true` with `r2.sh`) with shared CPU state and replicated DP.
+Keep `student_teacher_pipeline`, `teacher_forward_overlap`, `teacher_param_prefetch`
+and `pipeline_overlap` false. Teacher FSDP must be NO_SHARD, SP=1, frozen,
+CPU-offloaded, with identical layouts, fixed single micro-batches, and no parameter
+mixed precision or forward prefetch. The existing single-GPU asynchronous mode is unchanged.
+
+Each rank owns one teacher-sized set of GPU flat-parameter slots. Math, Code, IF
+copy their distinct shared mmap shards into those same addresses immediately
+before their own forward. Copies block; no pinned replica or next-teacher prefetch
+is created. Slot reuse waits for the previous GPU use, including root/tied weights.
+Shared CPU source pointers are checked before copying. Closing restores ordinary FSDP.
+
+Run `experiments/run_teacher_slots.py --output /mnt/sda1/zst/RONDO/experiments/<run>`
+using the training Python environment. Add `--model-root /home/xxf/Distill/models`
+for actual Math/Code/IF weights, or `--closed-loop` for the tiny MOPD training
+acceptance. The driver waits for all four GPUs to be idle for 60 seconds and saves
+logs/config/metrics in the output directory. The logits test compares two full
+teacher cycles bitwise with original FSDP, checks slot addresses and mmap sources,
+and checks ordinary forward after close. It measures PyTorch allocated and reserved
+peaks after model initialization (eight tokens per rank); these are teacher-only
+measurements, not full 4096-token training peaks. A persistent slot pool need not
+reduce peak allocated memory against an original path that already offloads and
+releases every teacher after forward; allocator-reserved memory may change separately.
