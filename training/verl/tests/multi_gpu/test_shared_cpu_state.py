@@ -145,6 +145,10 @@ def gpu_worker():
         assert any(len(chunk) > 1 for chunk in optimizer.chunks), 'must pack across parameter boundaries'
         assert optimizer.workspace.numel() * optimizer.workspace.element_size() == 4 * 28
         assert not any(item['model'] == 'gradient/rank_slots' for item in optimizer.store.inventory())
+        expected_slots = 1 if optimizer.reduce_mode == 'serial' else 2
+        assert len(optimizer.workspaces) == expected_slots
+        assert all(buffer.is_pinned() for buffer in optimizer.staging)
+        assert sum(buffer.nbytes for buffer in optimizer.staging) == (0 if expected_slots == 1 else 56)
         step_reports = []
         for expected_step in (1, 2):
             with actor.no_sync():
@@ -269,6 +273,29 @@ def gpu_worker():
                 torch.testing.assert_close(optimizer.state[actual][key], reference_optimizer.state[target][key],
                                            atol=2e-6, rtol=2e-5)
         assert optimizer.publisher.version == 3
+        optimizer.zero_grad()
+
+        # Delayed producer on a non-default stream, mixed rank-local absence,
+        # and one globally absent parameter exercise event and zero-fill reuse.
+        producer = torch.cuda.Stream(device=device)
+        producer.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(producer):
+            torch.cuda._sleep(2_000_000)
+            for index, parameter in enumerate(student.parameters()):
+                if index == 1 or (index == 0 and rank == 3):
+                    parameter.grad = None
+                else:
+                    parameter.grad = torch.full_like(parameter, rank + 1)
+            norm = optimizer.clip_grad_norm_(float('inf'))
+        expected_squared = 0.0
+        for index, ((parameter, master, _), (_, reduced)) in enumerate(zip(
+                optimizer.pairs, optimizer.grad_buffers, strict=True)):
+            value = 0.0 if index == 1 else (1.5 if index == 0 else 2.5)
+            expected_squared += value * value * parameter.numel()
+            torch.testing.assert_close(reduced, torch.full_like(reduced, value), atol=0, rtol=0)
+            if rank == optimizer.owner_rank:
+                assert (master.grad is None) == (index == 1)
+        torch.testing.assert_close(norm, torch.tensor(expected_squared).sqrt(), atol=2e-6, rtol=2e-5)
         optimizer.zero_grad()
 
         teachers = []

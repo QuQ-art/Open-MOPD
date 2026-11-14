@@ -149,3 +149,26 @@ Rank workspaces require `world_size * 256 MiB`, plus one full FP32 reduced-gradi
 buffer (`parameter_count * 4` bytes). Global norm/clipping happens only after all
 chunks complete; no partial Adam updates are allowed. They are transient workspace, excluded from
 optimizer checkpoints; masters/moments remain shared and restored in place.
+
+### 双缓冲与异步 CPU reduce
+
+`SharedCPUAdamW(..., reduce_mode=...)` 支持 `serial`、`double_buffer`、`async`。
+也可在所有 rank 统一设置 `OPENMOPD_CPU_REDUCE_MODE`；默认 `async`。
+`serial` 保留原来的阻塞 D2H 到单个 mmap workspace；`double_buffer` 使用
+两个私有 pinned staging 与两个共享 workspace，但 D2H 阻塞；`async` 在独立
+CUDA stream 上把下一块 D2H 与 owner 当前块 CPU reduce 重叠。
+
+CPU 必须等待 D2H completion event 后才能读 staging，并将有效区间复制到
+当前共享 workspace。ready barrier 确认所有 rank 发布完成，consumed barrier
+保证 owner reduce 完成后才复用槽。所有 chunks 完成后统一计算全局 norm、裁剪
+和执行 AdamW；backward 与无 GPU 参数广播的权重发布路径不变。
+
+256 MiB/rank 时共享 workspace 从 1 GiB 增至 2 GiB，另有四 rank 合计 2 GiB
+的 pinned staging；完整 reduced-gradient 缓冲不变。scratch 不进 checkpoint。
+`last_reduce_metrics` 包含 D2H、completion 等待、staging→shared memcpy、owner
+reduce、barrier、transport 总耗时及含 norm/clip 的总耗时；overlap 分项不可相加。
+
+运行 `experiments/run_cpu_reduce_async.py --output /mnt/sda1/zst/RONDO/experiments/<run>`，
+等待四卡空闲 60 秒后依次验证三模式，再以正式 Student 参数量做配对性能测试。
+`experiments/summarize_cpu_reduce_async.py <run>` 生成报告。该 microbenchmark 不包含
+rollout/backward/AdamW，不能替代完整训练吞吐验收。
