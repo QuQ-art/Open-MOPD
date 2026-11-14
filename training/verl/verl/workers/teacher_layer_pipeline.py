@@ -13,6 +13,10 @@
 # limitations under the License.
 """One teacher's worth of CUDA slots, handed to the next teacher layer by layer.
 
+Sequential mode copies the active teacher from shared CPU mappings before its
+forward, with no prefetch or private pinned replica. The asynchronous single-GPU
+mode is retained below.
+
 Frozen FSDP1 teachers execute in a fixed ring. After each FSDP wrapper returns,
 its compute stream records the last use of that slot; a copy stream waits for
 that event before overwriting it with the next teacher's pinned CPU shard.
@@ -39,7 +43,10 @@ class _Slot:
 
 
 class TeacherLayerPipeline:
-    """Inference-only, single-GPU NO_SHARD with identical FSDP wrapping.
+    """Inference-only NO_SHARD with identical rank-local FSDP wrapping.
+
+    sequential=True uses blocking copies directly from shared CPU mappings.
+    The default retains the single-GPU pinned-memory prefetch ring.
 
     Each wrapper must execute exactly once per forward, under no_grad. Parameters
     must remain immutable and may only be used inside their owning wrapper (root
@@ -47,11 +54,12 @@ class TeacherLayerPipeline:
     aliases or launch parameter-consuming work on unsynchronized side streams.
     """
 
-    def __init__(self, models: list[FSDP], names: list[str], max_mb: int, slot_tensors=None):
+    def __init__(self, models: list[FSDP], names: list[str], max_mb: int, slot_tensors=None, *, sequential=False):
         if len(models) < 2 or len(models) != len(names) or len(set(names)) != len(names):
             raise ValueError("teacher layer pipeline requires at least two distinct named teachers")
         if max_mb <= 0:
             raise ValueError("teacher_layer_pipeline_max_mb must be positive")
+        self.sequential = sequential
         self.modules = []
         signature = None
         for model in models:
@@ -70,7 +78,7 @@ class TeacherLayerPipeline:
                 handle = module._handle
                 source = handle.flat_param._local_shard
                 if (
-                    handle.world_size != 1
+                    (handle.world_size != 1 and not sequential)
                     or handle.uses_sharded_strategy
                     or not handle._offload_params
                     or handle._use_orig_params
@@ -83,11 +91,15 @@ class TeacherLayerPipeline:
                     )
                 if (
                     source.device.type != "cpu"
-                    or not source.is_pinned()
+                    or handle.flat_param.requires_grad
+                    or (not sequential and not source.is_pinned())
                     or handle.flat_param.device.type != "cpu"
                     or handle._training_state != HandleTrainingState.IDLE
                 ):
-                    raise ValueError("teacher layer pipeline requires idle, pinned CPU shards")
+                    raise ValueError("teacher layer pipeline requires idle CPU shards (pinned for asynchronous mode)")
+                shared = getattr(handle.flat_param, "_openmopd_shared_cpu", None)
+                if shared is not None and shared.data_ptr() != source.data_ptr():
+                    raise ValueError("teacher slot source must retain its shared CPU mapping")
                 if "pre_unshard" in handle.__dict__:
                     raise ValueError("teacher layer pipeline cannot share a handle with another prefetcher")
                 layout.append(
@@ -110,7 +122,7 @@ class TeacherLayerPipeline:
             raise ValueError(f"teacher slot pool is {self.bytes} bytes, above the {max_mb} MiB cap")
         self.names = names
         self.device = models[0].compute_device
-        self.stream = torch.cuda.Stream(device=self.device)
+        self.stream = None if sequential else torch.cuda.Stream(device=self.device)
         self.slots = {
             name: _Slot(
                 slot_tensors[name] if slot_tensors is not None
@@ -119,7 +131,8 @@ class TeacherLayerPipeline:
             for name, module in self.modules[0].items()
         }
         # Respect the allocator history of storage allocated on the caller's stream.
-        self.stream.wait_stream(torch.cuda.current_stream(self.device))
+        if self.stream is not None:
+            self.stream.wait_stream(torch.cuda.current_stream(self.device))
         self.copy_counts = [0] * len(models)
         self.use_counts = [0] * len(models)
         self.expected = 0
@@ -149,7 +162,22 @@ class TeacherLayerPipeline:
         slot = self.slots[name]
         if slot.in_use:
             raise RuntimeError(f"attempt to overwrite an active teacher slot: {name}")
-        source = self.modules[index][name]._handle.flat_param._local_shard
+        flat = self.modules[index][name]._handle.flat_param
+        source = flat._local_shard
+        if hasattr(flat, "_openmopd_shared_cpu"):
+            from verl.workers.multi_gpu.teacher_store import SharedTeacherStore
+
+            source = SharedTeacherStore.h2d_source(flat)
+        if self.sequential:
+            if last_use is not None:
+                last_use.synchronize()
+            # Pageable mmap stays the actual H2D source; no private pinned replica.
+            slot.tensor.copy_(source, non_blocking=False)
+            slot.ready = torch.cuda.Event()
+            slot.ready.record(torch.cuda.current_stream(self.device))
+            slot.owner = index
+            self.copy_counts[index] += 1
+            return
         label = name or "root"
         with (
             torch.cuda.stream(self.stream),
@@ -167,6 +195,8 @@ class TeacherLayerPipeline:
     def prefetch_first(self):
         """Prime the cold ring during student scoring; later cycles are already primed."""
         self._check_live()
+        if self.sequential:
+            return  # No copying during student scoring.
         if not self.lock.acquire(blocking=False):
             raise RuntimeError("cannot prime teacher slots during a teacher forward")
         try:
@@ -190,7 +220,10 @@ class TeacherLayerPipeline:
         try:
             if index != self.expected:
                 raise RuntimeError(f"expected teacher {self.names[self.expected]}, got {self.names[index]}")
-            if index == 0:
+            if self.sequential:
+                for name in self.slots:
+                    self._stage(index, name, self.slots[name].ready)
+            elif index == 0:
                 self._prime()
             self.active = (index, threading.get_ident())
             self.seen = set()
@@ -232,7 +265,11 @@ class TeacherLayerPipeline:
         handle._use_unsharded_views(as_params=False)
         slot.in_use = False
         self.released.add(name)
-        self._stage((index + 1) % len(self.names), name, last_use)
+        if self.sequential:
+            slot.ready = last_use
+            slot.owner = None
+        else:
+            self._stage((index + 1) % len(self.names), name, last_use)
 
     def _finish(self, index, module, args, output):
         if self.active != (index, threading.get_ident()):

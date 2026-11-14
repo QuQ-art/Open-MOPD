@@ -149,3 +149,31 @@ Rank workspaces require `world_size * 256 MiB`, plus one full FP32 reduced-gradi
 buffer (`parameter_count * 4` bytes). Global norm/clipping happens only after all
 chunks complete; no partial Adam updates are allowed. They are transient workspace, excluded from
 optimizer checkpoints; masters/moments remain shared and restored in place.
+
+
+### Sequential Teacher GPU slots
+
+Enable `actor_rollout_ref.rollout.teacher_layer_pipeline=true` (or
+`TEACHER_LAYER_PIPELINE=true` with `r2.sh`) with shared CPU state and replicated DP.
+Keep `student_teacher_pipeline`, `teacher_forward_overlap`, `teacher_param_prefetch`
+and `pipeline_overlap` false. Teacher FSDP must be NO_SHARD, SP=1, frozen,
+CPU-offloaded, with identical layouts, fixed single micro-batches, and no parameter
+mixed precision or forward prefetch. The existing single-GPU asynchronous mode is unchanged.
+
+Each rank owns one teacher-sized set of GPU flat-parameter slots. Math, Code, IF
+copy their distinct shared mmap shards into those same addresses immediately
+before their own forward. Copies block; no pinned replica or next-teacher prefetch
+is created. Slot reuse waits for the previous GPU use, including root/tied weights.
+Shared CPU source pointers are checked before copying. Closing restores ordinary FSDP.
+
+Run `experiments/run_teacher_slots.py --output /mnt/sda1/zst/RONDO/experiments/<run>`
+using the training Python environment. Add `--model-root /home/xxf/Distill/models`
+for actual Math/Code/IF weights, or `--closed-loop` for the tiny MOPD training
+acceptance. The driver waits for all four GPUs to be idle for 60 seconds and saves
+logs/config/metrics in the output directory. The logits test compares two full
+teacher cycles bitwise with original FSDP, checks slot addresses and mmap sources,
+and checks ordinary forward after close. It measures PyTorch allocated and reserved
+peaks after model initialization (eight tokens per rank); these are teacher-only
+measurements, not full 4096-token training peaks. A persistent slot pool need not
+reduce peak allocated memory against an original path that already offloads and
+releases every teacher after forward; allocator-reserved memory may change separately.

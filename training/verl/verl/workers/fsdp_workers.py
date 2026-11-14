@@ -218,7 +218,7 @@ def _mopd_release_init_host_cache(label):
 
 @torch.no_grad()
 def _mopd_prepare_inference_teacher(model, label):
-    """Keep only pinned parameter storage for an inference-only FSDP1 teacher."""
+    """Keep only pinned or shared-mmap parameter storage for a frozen FSDP1 teacher."""
     from torch.distributed.fsdp._runtime_utils import _lazy_init
     from verl.utils.pinned_memory import empty_pinned_like, pinned_alignment_bytes
 
@@ -1249,8 +1249,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @memory_stage("prepare_teacher_layer_pipeline")
     def prepare_teacher_layer_pipeline(self):
         """Connect colocated teachers in the same order used by MT-OPD scoring."""
-        if self.world_size != 1 or self.ulysses_sequence_parallel_size != 1:
-            raise ValueError("teacher layer pipeline requires one GPU and SP=1")
+        if (self.world_size != 1 and not self._multi_gpu) or self.ulysses_sequence_parallel_size != 1:
+            raise ValueError("teacher layer pipeline requires single GPU or replicated DP, and SP=1")
+        if self._multi_gpu and any(self.config.rollout.get(key, False) for key in (
+            "student_teacher_pipeline", "teacher_forward_overlap", "teacher_param_prefetch", "pipeline_overlap"
+        )):
+            raise ValueError("multi-GPU teacher slots require sequential scoring with all overlap disabled")
         roles = ["rm"] + sorted(
             (name for name in self.fused_worker_dict if name.startswith("mt_rm_")),
             key=lambda name: int(name.removeprefix("mt_rm_")),
@@ -1260,7 +1264,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             raise ValueError("teacher layer pipeline requires at least two colocated MT-OPD teachers")
         for teacher in teachers:
             if (
-                teacher.world_size != 1
+                teacher.world_size != self.world_size
                 or teacher.ulysses_sequence_parallel_size != 1
                 or teacher.config.use_dynamic_bsz
                 or (teacher.config.micro_batch_size_per_gpu or 0) < 1
@@ -1268,17 +1272,17 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 or teacher._do_switch_chat_template
             ):
                 raise ValueError(
-                    "teacher layer pipeline requires one GPU, SP=1, a positive fixed micro-batch size, "
+                    "teacher layer pipeline requires matching DP ranks, SP=1, a positive fixed micro-batch size, "
                     "unfused teachers and no chat-template switching"
                 )
             if getattr(teacher, "_teacher_layer_pipeline", None) is not None:
                 raise ValueError("teacher layer pipeline is already initialized")
             teacher.reward_module.eval()
             _mopd_prepare_inference_teacher(
-                teacher.reward_module, f"teacher pinned {teacher.config.model.path}"
+                teacher.reward_module, f"teacher CPU source {teacher.config.model.path}"
             )
         pipeline_type = TeacherLayerPipeline
-        pipeline_kwargs = {}
+        pipeline_kwargs = {"sequential": True} if self._multi_gpu else {}
         if self.config.rollout.get("student_teacher_pipeline", False):
             from verl.workers.student_teacher_pipeline import StudentTeacherPipeline
 
@@ -3458,7 +3462,8 @@ class RewardModelWorker(Worker, DistProfilerExtension):
 
         shared_store = getattr(self, "_shared_teacher_store", None)
         if shared_store is not None:
-            if precomputed_logits is not None or getattr(self, "_teacher_layer_pipeline", None) is not None:
+            pipeline = getattr(self, "_teacher_layer_pipeline", None)
+            if precomputed_logits is not None or (pipeline is not None and not pipeline.sequential):
                 raise ValueError("shared multi-GPU teachers require sequential scoring from shared CPU weights")
             shared_store.assert_shared_sources(self.reward_module)
 
