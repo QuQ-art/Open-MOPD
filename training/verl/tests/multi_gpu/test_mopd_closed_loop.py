@@ -104,6 +104,22 @@ def run_mopd_step(actor, optimizer, batch, model_config, device):
         store.assert_shared_sources(teacher)
         teacher_logps.append(actual)
         del reference
+    # Re-run the actual reward scoring path with rank-local slots, then use its
+    # results for the same routing, MT-OPD signal, backward and CPU Adam checks.
+    import inspect
+    from verl.workers.fsdp_workers import ActorRolloutRefWorker
+
+    roles = dict(zip(('rm', 'mt_rm_1', 'mt_rm_2'), scorers))
+    pipeline_worker = SimpleNamespace(
+        world_size=4, _multi_gpu=True, ulysses_sequence_parallel_size=1, fused_worker_dict=roles,
+        get_fused_worker_by_name=roles.get,
+        config=OmegaConf.create({'rollout': {'teacher_layer_pipeline_max_mb': 8192}}))
+    inspect.unwrap(ActorRolloutRefWorker.prepare_teacher_layer_pipeline)(pipeline_worker)
+    for index, scorer in enumerate(scorers):
+        actual = scorer._compute_rm_score(batch).batch['teacher_on_student_log_probs']
+        torch.testing.assert_close(actual, teacher_logps[index], atol=0, rtol=0)
+        teacher_logps[index] = actual
+    pipeline_worker._scoring_layer_pipeline.close()
     weights = build_domain_weights(batch.non_tensor_batch['domain'], ['math', 'code', 'if'], device)
     routed = select_routed_teacher_logprobs(teacher_logps, weights)
     torch.testing.assert_close(routed, teacher_logps[['math', 'code', 'if'].index(domains[rank])], atol=0, rtol=0)

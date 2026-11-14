@@ -119,10 +119,21 @@ class SharedTeacherStore:
             if not isinstance(module, FSDP) or module._handle is None:
                 continue
             flat = module._handle.flat_param
-            source = getattr(flat, "_openmopd_shared_cpu", None)
-            if (source is None or source.device.type != "cpu"
-                    or flat._local_shard.data_ptr() != source.data_ptr()):
-                raise RuntimeError(f"{self.model_id}/{name}: teacher H2D source is no longer shared CPU storage")
+            self.h2d_source(flat)
+
+    @staticmethod
+    def h2d_source(flat):
+        """Return the actual mmap shard, without pin_memory() creating a replica.
+
+        Sequential teacher slots use a blocking copy from this pageable source.
+        Future asynchronous transfers must register/stage explicitly instead.
+        """
+        source = getattr(flat, "_openmopd_shared_cpu", None)
+        shard = flat._local_shard
+        if (source is None or source.device.type != "cpu" or shard.data_ptr() != source.data_ptr()
+                or shard.shape != source.shape or shard.dtype != source.dtype):
+            raise RuntimeError("teacher H2D source is no longer shared CPU storage")
+        return source
 
     def finish_initialization(self):
         dist.barrier()

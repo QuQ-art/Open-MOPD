@@ -63,6 +63,20 @@ class MultiGPUEntrypointTests(unittest.TestCase):
                 self.assertIn(message, result.stderr)
                 self.assertNotIn('-m verl.trainer.main_ppo', result.stdout)
 
+    def test_sequential_teacher_slots(self):
+        result = self.launch('actor_rollout_ref.rollout.teacher_layer_pipeline=true',
+                             OPENMOPD_N_GPUS_PER_NODE='4')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for override, message in (
+            ('actor_rollout_ref.rollout.teacher_param_prefetch=true', 'teacher_param_prefetch'),
+            ('actor_rollout_ref.rollout.teacher_forward_overlap=true', 'teacher_forward_overlap'),
+            ('reward_model.use_dynamic_bsz=true', 'fixed micro-batches'),
+        ):
+            result = self.launch('actor_rollout_ref.rollout.teacher_layer_pipeline=true', override,
+                                 OPENMOPD_N_GPUS_PER_NODE='4')
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(message, result.stderr)
+
     def test_visibility(self):
         result = self.launch(OPENMOPD_N_GPUS_PER_NODE='2', CUDA_VISIBLE_DEVICES='0')
         self.assertNotEqual(result.returncode, 0)

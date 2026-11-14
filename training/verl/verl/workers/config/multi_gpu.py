@@ -52,10 +52,17 @@ def validate_multi_gpu(get):
     require(type(owner) is int and 0 <= owner < count, "optimizer_owner_rank must be in [0, world_size)")
     require(get(multi + "synchronous_update", True) is True, "synchronous_update must be true")
     require(type(get(multi + "verify_policy_version", True)) is bool, "verify_policy_version must be boolean")
-    for key in ("student_teacher_pipeline", "teacher_layer_pipeline",
+    for key in ("student_teacher_pipeline",
                 "teacher_forward_overlap", "teacher_param_prefetch", "pipeline_overlap", "cpu_adam_enabled",
                 "pipeline_fp32_gradients", "skip_initial_weight_sync"):
         require(get(prefix + key, False) is False, key + " must be false in multi-GPU mode")
+    if get(prefix + "teacher_layer_pipeline", False):
+        require(state_mode == "shared", "teacher_layer_pipeline requires shared CPU teacher state")
+        for teacher in ("reward_model", "mt_reward_model_1", "mt_reward_model_2"):
+            require(get(teacher + ".ulysses_sequence_parallel_size", 1) == 1,
+                    teacher + " teacher slots require SP=1")
+            require(get(teacher + ".use_dynamic_bsz", False) is False,
+                    teacher + " teacher slots require fixed micro-batches")
     if get(prefix + "share_weights", False):
         validate_replicated_weight_sharing({"mode": get(multi + "mode", "replicated_dp")}, count)
         require(get("actor_rollout_ref.actor.fsdp_config.param_offload", False) is False,
